@@ -163,7 +163,8 @@ sequenceDiagram
     participant R as Target repo (git)
     participant DB as Postgres
     rect rgb(255, 243, 224)
-    H->>C: run --scenario greenfield --requirement "..."
+    H->>C: run (greenfield)
+    Note over H,C: run --scenario greenfield<br/>--requirement "..."
     C->>G: invoke(initial state)
     end
     rect rgb(227, 242, 253)
@@ -183,11 +184,12 @@ sequenceDiagram
     end
     rect rgb(255, 224, 178)
     G-->>C: interrupt(release gate)
-    C-->>H: PAUSED, summary + resume command
+    C-->>H: PAUSED + resume command
     Note over C,DB: process may exit here
     end
     rect rgb(200, 230, 201)
-    H->>C: resume run_id --decision approve --approver me --rationale "..."
+    H->>C: resume (approve)
+    Note over H,C: resume run_id --decision approve<br/>--approver me --rationale "..."
     C->>G: Command(resume=...)
     G->>R: ff-merge run/id into main, tag release/id
     G->>DB: run_finished(succeeded)
