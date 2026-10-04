@@ -1,0 +1,24 @@
+name: agentic-sdlc-system
+
+# Infrastructure for the ORCHESTRATOR only (LangGraph checkpoints + audit event log).
+# The URL shortener it builds ships its OWN docker-compose.yml (app + Postgres + Redis),
+# created by the greenfield run inside the generated project.
+services:
+  orchestrator-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5433:5432"   # non-default host port - does not collide with a local Postgres
+    volumes:
+      - orchestrator-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  orchestrator-db-data:
