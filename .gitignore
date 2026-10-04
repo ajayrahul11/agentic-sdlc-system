@@ -1,6 +1,7 @@
 # Python
 orchestrator/.venv/
 **/__pycache__/
+*.egg-info/
 orchestrator/.env
 orchestrator/.pytest_cache/
 orchestrator/runs/

@@ -23,18 +23,38 @@ the workspace node's preconditions, not by convention.
 ```bash
 # 1) prove the wiring with NO keys / Docker / network (stub LLM, fake mvn, SQLite+JSONL)
 cd orchestrator && python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 pytest                                                   # 113 offline tests
-python -m app.main run --offline --scenario greenfield \
+python -m sdlc_orchestrator run --offline --scenario greenfield \
     --requirement "Build a URL shortener with shorten, redirect, and click analytics" --non-interactive
-python -m app.main resume <run_id> --offline --decision approve --approver you --rationale "smoke"
+python -m sdlc_orchestrator resume <run_id> --offline --decision approve --approver you --rationale "smoke"
 
 # 2) real run: see TODO.md (Phase 2)
 cp .env.example .env     # add ANTHROPIC_API_KEY, optionally LANGCHAIN_API_KEY
 docker compose -f ../docker-compose.yml up -d
-python -m app.main doctor
-python -m app.main run --scenario greenfield --requirement "Build a URL shortener with shorten, redirect, and click analytics"
+python -m sdlc_orchestrator doctor
+python -m sdlc_orchestrator run --scenario greenfield --requirement "Build a URL shortener with shorten, redirect, and click analytics"
 ```
+
+## Project layout
+
+```
+orchestrator/
+├── pyproject.toml            # deps, console script (sdlc-orchestrator), pytest config
+├── requirements.lock.txt     # fully pinned set
+├── src/sdlc_orchestrator/
+│   ├── cli/                  # entry points: main.py (run/resume/audit/...), dev.py (single-agent harness)
+│   ├── core/                 # config, state, events (audit log), checkpoint, tracing, metrics, failures
+│   ├── llm/                  # client.py (routing, retries, JSON repair), stubs.py (offline LLM)
+│   ├── workflow/             # graph.py, dag.py, stage.py, contracts.py, nodes/ (one module per agent)
+│   ├── policy/               # guardrails.py (blocking gate), java_scan.py
+│   └── integrations/         # gitops, runners (Maven/Docker), scaffold (Initializr), repo_io
+└── tests/
+    ├── unit/                 # per-module tests
+    └── e2e/                  # offline end-to-end graph runs
+```
+
+Dependencies point one way: `cli → workflow → (policy, integrations, llm) → core` (one exception: `llm/stubs.py` reuses the pure `workflow/dag.py` helpers).
 
 ## Architecture
 
@@ -163,12 +183,11 @@ sequenceDiagram
     participant R as Target repo (git)
     participant DB as Postgres
     rect rgb(255, 243, 224)
-    H->>C: run (greenfield)
-    Note over H,C: run --scenario greenfield<br/>--requirement "..."
+    H->>C: run --scenario greenfield
     C->>G: invoke(initial state)
     end
     rect rgb(227, 242, 253)
-    G->>L: requirements, decomposition, design (JSON, validated)
+    G->>L: requirements, design (validated JSON)
     G->>R: init repo, branch run/id, scaffold commit
     par impl_data branch
         G->>L: impl_data prompt
@@ -180,16 +199,15 @@ sequenceDiagram
     rect rgb(255, 249, 196)
     G->>G: quality_gate, then mvnw test
     G->>R: commit per approved task
-    G->>DB: checkpoint every step, audit event per transition
+    G->>DB: checkpoint + audit event per step
     end
     rect rgb(255, 224, 178)
     G-->>C: interrupt(release gate)
     C-->>H: PAUSED + resume command
-    Note over C,DB: process may exit here
+    C-->>C: process may exit here
     end
     rect rgb(200, 230, 201)
-    H->>C: resume (approve)
-    Note over H,C: resume run_id --decision approve<br/>--approver me --rationale "..."
+    H->>C: resume run_id, decision approve
     C->>G: Command(resume=...)
     G->>R: ff-merge run/id into main, tag release/id
     G->>DB: run_finished(succeeded)
@@ -354,7 +372,7 @@ purely from these rows, so every number traces back to events.
 | Test runtime | Docker via Testcontainers | Throw-away Postgres + Redis during `mvnw test` |
 | `--offline` mode | SQLite + JSONL under `orchestrator/runs/` | Zero-infra smoke testing with the stub LLM |
 
-## The agents (one module each, `orchestrator/app/nodes/`)
+## The agents (one module each, `orchestrator/src/sdlc_orchestrator/workflow/nodes/`)
 
 | Stage | Module | What it does |
 |---|---|---|
@@ -412,7 +430,7 @@ model output (DAG, design, paths, contract).
    scaffold URL/zip safety, and **full-graph end-to-end runs** with a deterministic stub LLM covering every
    path: greenfield, brownfield-after-greenfield, ambiguous, retry, fallback, rollback, replan (+bounded),
    infra abort, reject, rework-design, secret-blocking gate.
-2. **Live verification steps** in `TODO.md` — each prompt is exercised alone (`python -m app.dev ...`) before it is
+2. **Live verification steps** in `TODO.md` — each prompt is exercised alone (`python -m sdlc_orchestrator.cli.dev ...`) before it is
    trusted in the full graph, then the real Maven suite is what finally accepts the generated code.
 
 ## Trade-offs & decisions

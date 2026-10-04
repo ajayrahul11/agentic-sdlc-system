@@ -1,21 +1,2 @@
-# Orchestration core
-langgraph>=1.0
-langchain-core>=1.0
-langsmith>=0.2
-
-# Model provider (default: Anthropic). For OpenAI: pip install langchain-openai and set MODEL_PROVIDER=openai
-langchain-anthropic>=1.0
-
-# State store + audit log: Postgres (default) or SQLite (zero-infra, CHECKPOINTER=sqlite)
-langgraph-checkpoint-postgres>=2.0
-langgraph-checkpoint-sqlite>=2.0
-psycopg[binary,pool]>=3.2
-
-# Utilities
-pydantic>=2.9
-python-dotenv>=1.0.1
-rich>=13.8
-pyyaml>=6.0
-
-# Tests
-pytest>=8.0
+# Runtime + dev dependencies are declared in pyproject.toml; requirements.lock.txt pins the full set.
+-e .[dev]

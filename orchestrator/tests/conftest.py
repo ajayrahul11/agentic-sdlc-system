@@ -3,13 +3,7 @@ Test fixtures: every test runs fully OFFLINE - stub LLM, in-memory event
 sink and checkpointer, temp target repo, zero backoff. No Postgres, no
 API key, no Docker, no network.
 """
-import os
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 @pytest.fixture(autouse=True)
@@ -23,8 +17,9 @@ def offline_env(tmp_path, monkeypatch):
     for var in ("STUB_TEST_FAILURES", "STUB_FAILURE_CLASS", "MAX_RETRIES_PER_NODE", "MAX_REPLANS", "FALLBACK_AFTER_FAILURES"):
         monkeypatch.delenv(var, raising=False)
 
-    from app import events, runners
-    import app.checkpoint as checkpoint
+    from sdlc_orchestrator.core import events
+    from sdlc_orchestrator.integrations import runners
+    import sdlc_orchestrator.core.checkpoint as checkpoint
 
     sink = events.MemorySink()
     events.set_sink(sink)
