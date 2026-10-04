@@ -226,6 +226,11 @@ def check_migrations_immutable(changes: list[tuple[str, str]]) -> list[str]:
 # Design completeness (blocking gate between Design and Implementation)
 # ---------------------------------------------------------------------------
 
+REQUIRED_DESIGN_DOC_SECTIONS = ("Overview", "Architecture", "Data model", "API design", "Key flows",
+                                "Caching and consistency", "Scalability", "Security", "Failure modes",
+                                "Trade-offs")
+
+
 def check_design_completeness(design: dict, mode: str, existing_contract: dict | None = None,
                               existing_max_migration: int = 0) -> list[str]:
     failures = []
@@ -269,6 +274,14 @@ def check_design_completeness(design: dict, mode: str, existing_contract: dict |
             failures.append(f"design: component needs 'class' and branch in {sorted(VALID_BRANCHES)}: {c}")
     if plan and not {c.get("branch") for c in plan} >= VALID_BRANCHES and mode == "greenfield":
         failures.append("design: component_plan must assign work to BOTH impl_data and impl_api branches")
+
+    doc = design.get("design_document")
+    if not isinstance(doc, str) or not doc.strip():
+        failures.append("design: design_document (markdown design doc for human review) is missing")
+    elif mode == "greenfield":
+        for section in REQUIRED_DESIGN_DOC_SECTIONS:
+            if not re.search(rf"^##\s+{re.escape(section)}\b", doc, re.IGNORECASE | re.MULTILINE):
+                failures.append(f"design: design_document is missing the '## {section}' section")
 
     adr_text = " ".join(
         f"{a.get('title', '')} {a.get('decision', '')} {a.get('rationale', '')}" for a in design.get("adrs", [])

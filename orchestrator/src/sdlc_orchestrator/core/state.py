@@ -55,8 +55,8 @@ class Task(BaseModel):
 
 
 class ApprovalRecord(BaseModel):
-    gate: str                      # clarification | release
-    decision: str                  # approve | reject | rework_design | resolved
+    gate: str                      # clarification | design | release
+    decision: str                  # approve | reject | revise | rework_design | resolved
     approver: str                  # identity
     rationale: str = ""
     timestamp: str = Field(default_factory=now_iso)
@@ -158,6 +158,7 @@ class OrchestratorState(TypedDict, total=False):
     # --- Design ---
     design_doc: Annotated[dict, replace]
     design_feedback: Annotated[str, replace]
+    design_decision: Annotated[str, replace]    # "" | approve | reject | revise  (human design-review gate)
 
     # --- Implementation (two parallel branches write these) ---
     codegen_strategy: Annotated[str, replace]          # full | simple (fallback)

@@ -83,7 +83,10 @@ def pre_design(s: dict) -> list[str]:
 
 
 def pre_scaffold(s: dict) -> list[str]:
-    return [] if (s.get("design_doc") or {}).get("api_contract") else ["design_doc.api_contract missing"]
+    errs = [] if (s.get("design_doc") or {}).get("api_contract") else ["design_doc.api_contract missing"]
+    if s.get("design_decision") != "approve":
+        errs.append("design has not been approved by a human (design review gate)")
+    return errs
 
 
 def _pre_impl(s: dict) -> list[str]:

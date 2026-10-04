@@ -89,6 +89,71 @@ def clarification_node(state: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Design review gate (human approval BEFORE any code is generated)
+# ---------------------------------------------------------------------------
+
+def design_revisions(state: dict) -> int:
+    return sum(1 for a in state.get("approvals", []) if a.get("gate") == "design" and a.get("decision") == "revise")
+
+
+def _design_review_request(state: dict) -> dict:
+    run_id = state["run_id"]
+    design = state.get("design_doc", {})
+    review_file = config.runs_dir() / run_id / "DESIGN.md"
+    review_file.parent.mkdir(parents=True, exist_ok=True)
+    review_file.write_text(design.get("design_document", ""))
+    log_event(run_id, "design_review", "approval_requested", {
+        "revision": design_revisions(state), "review_file": str(review_file),
+        "endpoints": sorted(design.get("api_contract", {}).get("paths", {}).keys())},
+        actor="system:design", outcome="pending", reason="design must be approved by a human before code generation")
+    return {"status": "awaiting_approval", "_detail": {"review_file": str(review_file)}}
+
+
+design_review_request_node = stage("design_review_request", actor="system:design")(_design_review_request)
+
+
+def design_review_node(state: dict) -> dict:
+    """Human gate between Design and Scaffold/codegen. Resume value:
+    {"decision": "approve"|"reject"|"revise", "approver": str, "feedback": str}
+    approve -> scaffold; reject -> abort the run; revise -> Design re-runs
+    with the feedback and comes back here. Feedback with no decision means
+    revise; an unknown decision never approves."""
+    design = state.get("design_doc", {})
+    decision = interrupt({
+        "gate": "design",
+        "prompt": "Review the design. approve / reject / revise (revise needs feedback)",
+        "revision": design_revisions(state),
+        "design_document": design.get("design_document", ""),
+        "endpoints": sorted(design.get("api_contract", {}).get("paths", {}).keys()),
+        "migrations": [f"V{m.get('version')}__{m.get('name')}" for m in design.get("migrations", [])],
+        "components": [(c.get("class"), c.get("branch")) for c in design.get("component_plan", [])],
+        "adrs": [a.get("title") for a in design.get("adrs", [])],
+        "review_file": str(config.runs_dir() / state["run_id"] / "DESIGN.md"),
+    }) or {}
+    feedback = (decision.get("feedback") or decision.get("rationale") or "").strip()
+    d = decision.get("decision") or ("revise" if feedback else "")
+    if d not in ("approve", "reject", "revise"):
+        d = "reject"  # unknown input never approves
+    approver = decision.get("approver") or "unknown"
+
+    record = ApprovalRecord(gate="design", decision=d, approver=approver, rationale=feedback)
+    log_event(state["run_id"], "design_review", "approval_granted" if d == "approve" else "approval_rejected",
+              {"decision": d, "revision": design_revisions(state)}, actor=f"human:{approver}", outcome=d,
+              reason=feedback[:300] or None)
+
+    delta: dict = {"approvals": [dump(record)], "design_decision": d, "status": "running"}
+    if d == "reject":
+        delta.update({"abort_reason": f"design rejected by human ({approver})" + (f": {feedback[:200]}" if feedback else ""),
+                      "status": "failed"})
+    elif d == "revise":
+        delta["design_feedback"] = (
+            f"HUMAN DESIGN REVIEW (revision {design_revisions(state) + 1}) - the reviewer asked for these changes. "
+            f"Apply them to the previous design and keep everything they did not criticise:\n"
+            f"{feedback or 'revise the design (no details given)'}")
+    return delta
+
+
+# ---------------------------------------------------------------------------
 # Retry / fallback / rollback
 # ---------------------------------------------------------------------------
 

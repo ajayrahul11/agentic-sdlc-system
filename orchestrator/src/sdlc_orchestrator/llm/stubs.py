@@ -27,7 +27,47 @@ BASE = f"src/main/java/{PKG}"
 TEST = f"src/test/java/{PKG}"
 
 
-def _design(mode: str, existing: dict | None, max_mig: int) -> dict:
+def _design_document(mode: str, feedback: str | None) -> str:
+    doc = """# URL Shortener - Design Document
+
+## Overview
+Shorten long URLs, redirect by short code, and count clicks. Non-goals: user accounts, custom domains.
+
+## Architecture
+Client -> Spring Web controllers -> service layer -> Postgres (source of truth) with Redis (cache, ID counter, click counters).
+
+## Data model
+`url_mapping(id, short_code UNIQUE, original_url, created_at, expires_at, click_count)`. Redis: `seq:url` counter, `url:{code}` cache, `clicks:{code}` counters.
+
+## API design
+`POST /api/shorten` (API key, 201), `GET /{shortCode}` (302/404/410), `GET /api/analytics/{shortCode}` (200/404).
+
+## Key flows
+Shorten: validate -> next counter -> base62 -> persist -> cache. Redirect: cache-aside read, async click increment. Expiry: 410 once `expires_at` passes.
+
+## Caching and consistency
+Strong consistency for the mapping, eventual for click counts (Redis write-behind flushed every 5s).
+
+## Scalability and capacity
+Read-heavy (~100:1). Stateless instances scale horizontally; Redis counter is the only shared sequencer.
+
+## Security and rate limiting
+API key on mutating endpoints; per-IP fixed-window rate limit in Redis; URL scheme allow-list.
+
+## Failure modes
+Redis down: redirects fall back to Postgres, analytics degrade. Counter loss: reseed from max(id).
+
+## Trade-offs and open questions
+Counter IDs are guessable; a hash alternative was rejected for collision handling.
+"""
+    if mode == "brownfield":
+        doc += "\n## Change in this iteration\nAdds `GET /api/analytics/{shortCode}/geo` and the `click_geo` table.\n"
+    if feedback:
+        doc += f"\n## Revision history\nRevised after human review feedback:\n> {feedback[:400]}\n"
+    return doc
+
+
+def _design(mode: str, existing: dict | None, max_mig: int, feedback: str | None = None) -> dict:
     paths = {
         "/api/shorten": {"post": {"summary": "Create a short link", "responses": {"201": {"description": "created"}, "400": {"description": "validation"}, "401": {"description": "unauthorized"}, "429": {"description": "rate limited"}}}},
         "/{shortCode}": {"get": {"summary": "Redirect", "responses": {"302": {"description": "redirect"}, "404": {"description": "unknown"}, "410": {"description": "expired"}}}},
@@ -63,6 +103,7 @@ def _design(mode: str, existing: dict | None, max_mig: int) -> dict:
     return {
         "api_contract": {"openapi": "3.0.3", "info": {"title": "URL Shortener", "version": "1.0.0"}, "paths": paths},
         "migrations": migrations, "component_plan": plan, "adrs": adrs,
+        "design_document": _design_document(mode, feedback),
         "configuration": {"app.security.api-key": "${SHORTENER_API_KEY}", "app.rate-limit.requests-per-minute": "60",
                           "app.link.default-ttl-days": "30", "app.analytics.flush-interval-ms": "5000",
                           "app.cache.redirect-ttl-seconds": "3600"},
@@ -169,7 +210,8 @@ class StubLLM:
                                "regression_tests_to_watch": ["UrlShortenerIntegrationTest"]})
         if self.stage == "design":
             payload = json.loads(user)
-            return json.dumps(_design(payload["mode"], payload.get("existing_openapi"), payload.get("existing_max_migration_version", 0)))
+            return json.dumps(_design(payload["mode"], payload.get("existing_openapi"), payload.get("existing_max_migration_version", 0),
+                                      payload.get("design_feedback")))
         if self.stage == "codegen":
             branch = "impl_data" if "BRANCH: impl_data" in system else "impl_api"
             strategy = "full" if "STRATEGY: full" in system else "simple"

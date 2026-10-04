@@ -13,8 +13,13 @@ from sdlc_orchestrator.workflow.graph import build_graph
 from sdlc_orchestrator.cli.main import pending_interrupt
 
 
-def run(scenario, requirement, *, approve=None, clarification=None, run_id="r1", graph_holder=None):
-    """Drive a run. approve: dict for the release gate; clarification: dict for the clarification gate."""
+DESIGN_OK = {"decision": "approve", "approver": "rahul"}
+
+
+def run(scenario, requirement, *, approve=None, clarification=None, design=DESIGN_OK, run_id="r1", graph_holder=None):
+    """Drive a run. approve: dict for the release gate; clarification: dict for the clarification gate;
+    design: dict (or list of dicts, consumed in order) for the design review gate."""
+    design_answers = list(design) if isinstance(design, list) else [design]
     cfg = {"configurable": {"thread_id": run_id}, "recursion_limit": 120}
     with get_checkpointer() as cp:
         graph = build_graph(cp)
@@ -25,6 +30,9 @@ def run(scenario, requirement, *, approve=None, clarification=None, run_id="r1",
             if payload["gate"] == "clarification":
                 assert clarification is not None, "unexpected clarification gate"
                 graph.invoke(Command(resume=clarification), config=cfg)
+            elif payload["gate"] == "design":
+                assert design_answers, "unexpected design gate"
+                graph.invoke(Command(resume=design_answers.pop(0) if len(design_answers) > 1 else design_answers[0]), config=cfg)
             else:
                 assert approve is not None, "unexpected release gate"
                 graph.invoke(Command(resume=approve), config=cfg)
@@ -45,7 +53,7 @@ def test_greenfield_creates_the_project_through_the_orchestrator(offline_env):
     values, gates = run("greenfield", GREEN, approve=APPROVE)
 
     assert values["status"] == "succeeded"
-    assert gates == ["release"]
+    assert gates == ["design", "release"]
     assert (repo / "pom.xml").exists() and (repo / "mvnw").exists()
     assert (repo / "docs/openapi.yaml").exists() and (repo / "README.md").exists()
     assert any(p.name.startswith("V1__") for p in (repo / "src/main/resources/db/migration").iterdir())
@@ -101,6 +109,8 @@ def test_ambiguous_prompt_pauses_for_clarification_before_anything_is_built(offl
         assert not repo.exists()                    # nothing generated while ambiguous
         assert "assumptions_logged" in types(offline_env, "amb")
         graph.invoke(Command(resume={"resolution": "99.9% availability, redirect p99 < 50ms", "approver": "rahul"}), config=cfg)
+        assert pending_interrupt(graph, cfg)["gate"] == "design"
+        graph.invoke(Command(resume=DESIGN_OK), config=cfg)
         assert pending_interrupt(graph, cfg)["gate"] == "release"
         graph.invoke(Command(resume=APPROVE), config=cfg)
         values = graph.get_state(cfg).values
@@ -195,9 +205,12 @@ def test_human_can_send_release_back_to_design(offline_env):
     with get_checkpointer() as cp:
         graph = build_graph(cp)
         graph.invoke({"run_id": "rw", "scenario": "greenfield", "raw_requirement": GREEN, "status": "running"}, config=cfg)
+        graph.invoke(Command(resume=DESIGN_OK), config=cfg)
         assert pending_interrupt(graph, cfg)["gate"] == "release"
         graph.invoke(Command(resume={"decision": "rework_design", "approver": "rahul", "rationale": "ADR on caching is weak"}), config=cfg)
-        assert pending_interrupt(graph, cfg)["gate"] == "release"          # went back through Design and is awaiting approval again
+        assert pending_interrupt(graph, cfg)["gate"] == "design"           # re-designed output is re-reviewed by a human
+        graph.invoke(Command(resume=DESIGN_OK), config=cfg)
+        assert pending_interrupt(graph, cfg)["gate"] == "release"          # and is awaiting release approval again
         v = graph.get_state(cfg).values
         assert v["replans"][0]["cause"] == "human_rejected_design"
         graph.invoke(Command(resume=APPROVE), config=cfg)
@@ -246,3 +259,69 @@ def test_policy_gate_blocks_a_hardcoded_secret_then_retry_fixes_it(offline_env, 
     # the gate ran BEFORE tests: the stubbed test runner was only invoked once (on the clean attempt)
     assert len([e for e in offline_env.read("r1") if e["event_type"] == "test_pass"]) == 1
     assert not (config.target_repo() / "src/main/java/com/rahul/urlshortener/config/Leaky.java").exists()   # model removed it via DELETE
+
+
+# ---------------------------------------------------------------------------
+# Design review gate (human approval before ANY code is generated)
+# ---------------------------------------------------------------------------
+
+def test_design_gate_pauses_before_scaffold_and_shows_the_design_document(offline_env):
+    cfg = {"configurable": {"thread_id": "dg"}, "recursion_limit": 120}
+    with get_checkpointer() as cp:
+        graph = build_graph(cp)
+        graph.invoke({"run_id": "dg", "scenario": "greenfield", "raw_requirement": GREEN, "status": "running"}, config=cfg)
+        payload = pending_interrupt(graph, cfg)
+        assert payload["gate"] == "design"
+        assert "## Architecture" in payload["design_document"] and payload["endpoints"] and payload["adrs"]
+        assert (config.runs_dir() / "dg" / "DESIGN.md").read_text() == payload["design_document"]
+        assert not (config.target_repo() / "pom.xml").exists()           # no scaffold, no code yet
+        assert "scaffold" not in [e["node"] for e in offline_env.read("dg")]
+        graph.invoke(Command(resume=DESIGN_OK), config=cfg)
+        assert pending_interrupt(graph, cfg)["gate"] == "release"
+
+
+def test_approved_design_is_committed_as_docs_design_md(offline_env):
+    values, gates = run("greenfield", GREEN, approve=APPROVE)
+    assert gates == ["design", "release"]
+    assert values["design_decision"] == "approve"
+    assert [(a["gate"], a["decision"]) for a in values["approvals"]] == [("design", "approve"), ("release", "approve")]
+    design_md = (config.target_repo() / "docs/DESIGN.md").read_text()
+    assert "## Data model" in design_md and "## Failure modes" in design_md
+
+
+def test_rejected_design_aborts_before_any_code_is_generated(offline_env):
+    values, gates = run("greenfield", GREEN, design={"decision": "reject", "approver": "rahul", "feedback": "wrong approach"})
+    assert gates == ["design"]
+    assert values["status"] == "failed" and "design rejected" in values["abort_reason"]
+    assert not (config.target_repo() / "pom.xml").exists() and not (config.target_repo() / "src").exists()
+    assert values["approvals"][-1]["gate"] == "design" and values["approvals"][-1]["decision"] == "reject"
+    assert not values.get("commits")
+
+
+def test_design_feedback_revises_the_design_then_proceeds(offline_env):
+    values, gates = run("greenfield", GREEN, approve=APPROVE, design=[
+        {"decision": "revise", "approver": "rahul", "feedback": "add Redis-down failover detail"}, DESIGN_OK])
+    assert gates == ["design", "design", "release"]
+    assert values["status"] == "succeeded"
+    assert [a["decision"] for a in values["approvals"] if a["gate"] == "design"] == ["revise", "approve"]
+    assert "add Redis-down failover detail" in values["design_doc"]["design_document"]   # the revision saw the feedback
+    assert values["plan_version"] == 1                                   # a review revision is not a replan
+    assert "add Redis-down failover detail" in (config.target_repo() / "docs/DESIGN.md").read_text()
+
+
+def test_feedback_without_a_decision_means_revise_and_unknown_decision_never_approves(offline_env):
+    values, gates = run("greenfield", GREEN, approve=APPROVE, design=[{"feedback": "tighten the ADRs", "approver": "rahul"}, DESIGN_OK])
+    assert gates.count("design") == 2 and values["status"] == "succeeded"
+
+
+def test_unknown_design_decision_never_approves(offline_env):
+    values, gates = run("greenfield", GREEN, design={"decision": "yolo", "approver": "x"})
+    assert gates == ["design"] and values["status"] == "failed"
+    assert not (config.target_repo() / "pom.xml").exists()
+
+
+def test_scaffold_precondition_blocks_an_unapproved_design(offline_env):
+    from sdlc_orchestrator.workflow.contracts import pre_scaffold
+    design = {"api_contract": {"paths": {"/x": {"get": {}}}}}
+    assert any("not been approved" in e for e in pre_scaffold({"design_doc": design}))
+    assert pre_scaffold({"design_doc": design, "design_decision": "approve"}) == []

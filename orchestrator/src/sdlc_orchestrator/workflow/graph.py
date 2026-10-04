@@ -18,6 +18,10 @@ differentiator"): an explicit, stateful, gated dependency graph.
                                            |
    +-------------------------------------> design <------------------------+
    |                                       |                               |
+   |                          design_review_request                        |
+   |                                       |                               |
+   |       revise (feedback) <-- design_review (HUMAN GATE #2) --reject--> abort
+   |                                       | approve                       |
    |                                    scaffold  (greenfield; idempotent) |
    |                              +--------+--------+   PARALLEL FAN-OUT   |
    |                          impl_data          impl_api                  |
@@ -37,7 +41,7 @@ differentiator"): an explicit, stateful, gated dependency graph.
    |                                       |
    |                               release_readiness (final gate) --fail--> rollback
    |                                       |
-   |                              approval (HUMAN GATE #2)
+   |                              approval (HUMAN GATE #3)
    |            rework_design -> replan ---+--- approve/reject
    +---------------------------------------+        |
                                                finalize (merge+tag | back to main) -> END
@@ -51,8 +55,8 @@ from sdlc_orchestrator.core.failures import REPLAN_CLASSES
 from sdlc_orchestrator.workflow.nodes.codebase_reasoning_agent import codebase_reasoning_node
 from sdlc_orchestrator.workflow.nodes.codegen_agent import impl_api_node, impl_data_node
 from sdlc_orchestrator.workflow.nodes.control import (
-    abort_node, approval_node, clarification_node, clarification_request_node, finalize_node,
-    replan_node, replans_remaining, retries_in_epoch, retry_bookkeeping_node, rollback_node,
+    abort_node, approval_node, clarification_node, clarification_request_node, design_review_node,
+    design_review_request_node, finalize_node, replan_node, replans_remaining, retries_in_epoch, retry_bookkeeping_node, rollback_node,
 )
 from sdlc_orchestrator.workflow.nodes.decomposition_agent import decomposition_node
 from sdlc_orchestrator.workflow.nodes.design_agent import design_node
@@ -81,6 +85,13 @@ def route_after_clarification(state: dict) -> str:
 def route_after_decomposition(state: dict) -> str:
     mode = state.get("mode") or state.get("scenario")
     return "codebase_reasoning" if mode == "brownfield" else "design"
+
+
+def route_after_design_review(state: dict) -> str:
+    d = state.get("design_decision")
+    if d == "approve":
+        return "scaffold"
+    return "design" if d == "revise" else "abort"   # reject (or anything unknown) never proceeds
 
 
 def _retry_or_rollback(state: dict) -> str:
@@ -130,6 +141,8 @@ def build_graph(checkpointer):
         ("decomposition", decomposition_node),
         ("codebase_reasoning", codebase_reasoning_node),
         ("design", design_node),
+        ("design_review_request", design_review_request_node),
+        ("design_review", design_review_node),
         ("scaffold", scaffold_node),
         ("impl_data", impl_data_node),
         ("impl_api", impl_api_node),
@@ -156,7 +169,10 @@ def build_graph(checkpointer):
     g.add_conditional_edges("decomposition", route_after_decomposition,
                             {"codebase_reasoning": "codebase_reasoning", "design": "design"})
     g.add_edge("codebase_reasoning", "design")
-    g.add_edge("design", "scaffold")
+    g.add_edge("design", "design_review_request")
+    g.add_edge("design_review_request", "design_review")
+    g.add_conditional_edges("design_review", route_after_design_review,
+                            {"scaffold": "scaffold", "design": "design", "abort": "abort"})
 
     # Parallel fan-out; LangGraph waits for BOTH before quality_gate (sync point).
     g.add_edge("scaffold", "impl_data")

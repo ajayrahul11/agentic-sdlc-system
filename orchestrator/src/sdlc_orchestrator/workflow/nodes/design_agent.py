@@ -7,12 +7,17 @@ The design is the contract EVERY later stage is checked against:
   * component_plan -> the shared class list that lets the two parallel
                       codegen branches agree on names/signatures
   * adrs           -> decisions the brief says must be stated explicitly
+  * design_document-> the human-readable URL-shortener design (markdown,
+                      written to docs/DESIGN.md) that the HUMAN DESIGN
+                      REVIEW gate reads before any code is generated
 
 A design that fails the completeness gate (guardrails.check_design_
 completeness) is retried once with the failures as feedback, then fails
 the run loudly. On a re-plan, `design_feedback` carries the upstream
 failure (schema/contract mismatch or human rejection) so Design is
-re-run *informed*, not blindly restarted.
+re-run *informed*, not blindly restarted. Human feedback from the design
+review gate arrives the same way, so a "revise" re-runs this stage with the
+reviewer's comments and the previous design.
 """
 from __future__ import annotations
 
@@ -59,6 +64,16 @@ horizontal scalability trade-off; (2) consistency - strong for mapping, eventual
 redirect reads and the invalidation path on update/delete/custom-alias overwrite; (4) rate limiting \
 approach; (5) link expiry/TTL semantics.
 
+"design_document": the URL-shortener DESIGN DOCUMENT as a markdown string, written for a human reviewer who \
+must approve it before any code is generated. Use these H2 sections, in order: "## Overview" (problem, goals, \
+non-goals), "## Architecture" (components and how a request flows through them; a mermaid diagram is welcome), \
+"## Data model" (tables, columns, indexes, Redis keys), "## API design" (each endpoint: purpose, request, \
+responses, status codes), "## Key flows" (shorten, redirect, analytics, expiry), "## Caching and consistency", \
+"## Scalability and capacity" (read/write ratio, bottlenecks, how it scales horizontally), "## Security and \
+rate limiting", "## Failure modes" (Redis/Postgres down, counter loss, cache stampede) and "## Trade-offs and \
+open questions". It must agree exactly with api_contract, migrations and adrs; it explains them, it does not \
+replace them. BROWNFIELD: return the FULL updated document (you receive the existing one) and mark what changed.
+
 "configuration": exact Spring property names both teams must use, e.g. \
 {"app.security.api-key": "${SHORTENER_API_KEY}", "app.rate-limit.requests-per-minute": "60", \
 "app.link.default-ttl-days": "30", "app.analytics.flush-interval-ms": "5000", \
@@ -75,6 +90,11 @@ def _existing_contract(repo) -> dict | None:
     return (yaml.safe_load(f.read_text()) or None) if f.exists() else None
 
 
+def _existing_design_document(repo) -> str | None:
+    f = repo / "docs/DESIGN.md"
+    return f.read_text() if f.exists() else None
+
+
 def _impl(state: dict) -> dict:
     run_id = state["run_id"]
     mode = state.get("mode", "greenfield")
@@ -87,10 +107,12 @@ def _impl(state: dict) -> dict:
         "requirement_spec": state["requirement_spec"],
         "codebase_analysis": state.get("codebase_analysis"),
         "existing_openapi": existing_contract,
+        "existing_design_document": _existing_design_document(repo) if mode == "brownfield" else None,
         "existing_max_migration_version": max_mig,
         "design_feedback": state.get("design_feedback") or None,
         "previous_design_that_failed": (
-            {k: state.get("design_doc", {}).get(k) for k in ("migrations", "component_plan", "adrs")}
+            {k: state.get("design_doc", {}).get(k)
+             for k in ("api_contract", "migrations", "component_plan", "adrs", "configuration", "design_document")}
             if state.get("design_feedback") else None),
     }
     user = json.dumps(payload)
@@ -113,12 +135,14 @@ def _impl(state: dict) -> dict:
     return {
         "design_doc": design,
         "design_feedback": "",
+        "design_decision": "",   # every (re)design must be re-approved by a human before scaffold
         "tasks": set_task_status(state, ["design"], "done"),
         "_detail": {
             "endpoints": sorted(design["api_contract"].get("paths", {}).keys()),
             "components": len(design.get("component_plan", [])),
             "adrs": [a.get("title") for a in design.get("adrs", [])],
             "replanned": bool(state.get("design_feedback")),
+            "design_document_chars": len(design.get("design_document", "")),
         },
     }
 

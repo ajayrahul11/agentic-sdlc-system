@@ -7,6 +7,8 @@ CLI for the agentic SDLC orchestrator.
     python -m sdlc_orchestrator run --scenario ambiguous  --requirement "Make the system more reliable"
     python -m sdlc_orchestrator run ... --non-interactive    # pause at human gates and exit
     python -m sdlc_orchestrator resume <run_id> --decision approve --approver rahul --rationale "tests green"
+    python -m sdlc_orchestrator resume <run_id> --design-decision approve --approver rahul        # design gate
+    python -m sdlc_orchestrator resume <run_id> --feedback "add an ADR on cache stampedes" --approver rahul
     python -m sdlc_orchestrator resume <run_id> --resolution "Target 99.9% availability" --approver rahul
     python -m sdlc_orchestrator status  <run_id>
     python -m sdlc_orchestrator audit   <run_id>             # who/what/when/why/outcome timeline
@@ -63,8 +65,20 @@ def pending_interrupt(graph, cfg) -> dict | None:
 
 def prompt_for(payload: dict) -> dict:
     rprint(f"\n[bold yellow]>>> HUMAN GATE: {payload.get('gate')}[/bold yellow]")
-    rprint(payload)
+    if payload.get("gate") == "design":
+        rprint(payload.get("design_document", ""))
+        rprint({k: v for k, v in payload.items() if k != "design_document"})
+    else:
+        rprint(payload)
     who = input(f"Your name/identity [{getpass.getuser()}]: ").strip() or getpass.getuser()
+    if payload.get("gate") == "design":
+        choice = input("Design: [a]pprove / [r]eject (abort run) / [c]hange (give feedback): ").strip().lower()
+        if choice[:1] == "a":
+            return {"decision": "approve", "approver": who}
+        feedback = input("Feedback / reason: ").strip()
+        if choice[:1] == "c" and feedback:
+            return {"decision": "revise", "approver": who, "feedback": feedback}
+        return {"decision": "reject", "approver": who, "feedback": feedback}
     if payload.get("gate") == "clarification":
         text = input("Answer the ambiguities (empty = accept the listed assumptions, 'abort' = stop): ").strip()
         if text.lower() == "abort":
@@ -84,9 +98,15 @@ def drive(graph, cfg, first_input, interactive: bool) -> dict:
         if not interactive:
             rprint(f"\n[bold yellow]Run PAUSED at human gate '{payload.get('gate')}'.[/bold yellow]")
             rprint(payload)
+            if payload.get("gate") == "design":
+                resume_hint = ("--design-decision approve|reject|revise --approver NAME "
+                               "[--feedback 'what to change']")
+            elif payload.get("gate") == "clarification":
+                resume_hint = "--resolution '...' --approver NAME"
+            else:
+                resume_hint = "--decision approve|reject|rework_design --approver NAME --rationale '...'"
             rprint(f"Resume with:  python -m sdlc_orchestrator resume {cfg['configurable']['thread_id']} "
-                   + ("--resolution '...' --approver NAME" if payload.get("gate") == "clarification"
-                      else "--decision approve|reject|rework_design --approver NAME --rationale '...'"))
+                   + resume_hint)
             return graph.get_state(cfg).values
         graph.invoke(Command(resume=prompt_for(payload)), config=cfg)
     return graph.get_state(cfg).values
@@ -157,6 +177,11 @@ def cmd_resume(args) -> int:
             return 1
         if payload["gate"] == "clarification":
             value = {"resolution": args.resolution or "", "approver": args.approver, "proceed": not args.decline}
+        elif payload["gate"] == "design":
+            if not (args.design_decision or args.feedback):
+                rprint("[red]--design-decision approve|reject|revise (or --feedback '...') is required for the design gate[/red]")
+                return 1
+            value = {"decision": args.design_decision or "", "approver": args.approver, "feedback": args.feedback or ""}
         else:
             if not args.decision:
                 rprint("[red]--decision approve|reject|rework_design is required for the release gate[/red]")
@@ -324,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
     sp = add("resume", cmd_resume, help="resume a paused run at its human gate")
     sp.add_argument("run_id")
     sp.add_argument("--decision", choices=["approve", "reject", "rework_design"])
+    sp.add_argument("--design-decision", choices=["approve", "reject", "revise"], help="answer to the design review gate")
+    sp.add_argument("--feedback", help="design review feedback; with no --design-decision it means 'revise'")
     sp.add_argument("--resolution", help="answer to clarification gate (empty = accept assumptions)")
     sp.add_argument("--decline", action="store_true", help="decline the clarification gate (aborts the run)")
     sp.add_argument("--approver", default=getpass.getuser())

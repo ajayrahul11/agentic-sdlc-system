@@ -124,6 +124,7 @@ GOOD_DESIGN = {
     "adrs": [{"title": t, "decision": d, "rationale": "r", "alternatives_considered": "alt"} for t, d in [
         ("ID generation", "base62 counter"), ("Consistency", "eventual analytics"), ("Caching", "cache-aside"),
         ("Rate limiting", "per ip"), ("Expiry", "ttl")]],
+    "design_document": "\n".join(f"## {h}\nx" for h in g.REQUIRED_DESIGN_DOC_SECTIONS),
 }
 
 
@@ -137,6 +138,14 @@ def test_design_gate_catches_gaps():
     assert any("required endpoint missing" in m for m in msgs)
     assert any("no ADR covering 'caching'" in m for m in msgs)
     assert any("component_plan is empty" in m for m in msgs)
+
+
+def test_design_gate_requires_the_design_document_and_its_sections():
+    missing = {k: v for k, v in GOOD_DESIGN.items() if k != "design_document"}
+    assert any("design_document" in m and "missing" in m for m in g.check_design_completeness(missing, "greenfield"))
+    partial = {**GOOD_DESIGN, "design_document": "## Overview\nonly this"}
+    msgs = g.check_design_completeness(partial, "greenfield")
+    assert any("'## Failure modes'" in m for m in msgs) and not any("'## Overview'" in m for m in msgs)
 
 
 def test_brownfield_design_cannot_break_existing_contract_or_reuse_migration_versions():

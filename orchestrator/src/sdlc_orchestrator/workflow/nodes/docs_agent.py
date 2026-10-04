@@ -1,5 +1,5 @@
 """
-Docs stage: README + CHANGELOG entry + ADR files for the generated
+Docs stage: README + CHANGELOG entry + design document (docs/DESIGN.md) + ADR files for the generated
 project. Deliberately a TEMPLATE filled from state (not a creative-writing
 prompt) so the documentation is accurate to what was actually built and
 tested. docs/openapi.yaml was already written verbatim from the design.
@@ -80,7 +80,7 @@ curl -X POST localhost:8080/api/shorten -H "X-API-Key: $SHORTENER_API_KEY" -H 'C
 ## Architecture decisions
 {adrs}
 
-See `docs/adr/` for the full records.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design document and `docs/adr/` for the decision records.
 """
 
 
@@ -91,6 +91,9 @@ def _impl(state: dict) -> dict:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     files: dict[str, str] = {"README.md": render_readme(state)}
+
+    if design.get("design_document"):
+        files["docs/DESIGN.md"] = design["design_document"].rstrip("\n") + "\n"
 
     n = _next_adr_number(repo)
     for adr in design.get("adrs", []):
@@ -114,7 +117,7 @@ def _impl(state: dict) -> dict:
     files["CHANGELOG.md"] = existing.rstrip("\n") + "\n\n" + entry
 
     written = write_files(repo, files)
-    msg = f"task(write-docs): README, CHANGELOG, ADRs [run {run_id}]"
+    msg = f"task(write-docs): README, CHANGELOG, design doc, ADRs [run {run_id}]"
     sha = gitops.commit_paths(repo, written, msg)
     ws = dict(state["workspace"])
     ws["last_good_sha"] = sha

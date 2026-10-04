@@ -24,9 +24,12 @@ the workspace node's preconditions, not by convention.
 # 1) prove the wiring with NO keys / Docker / network (stub LLM, fake mvn, SQLite+JSONL)
 cd orchestrator && python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                                   # 113 offline tests
+pytest                                                   # 122 offline tests
 python -m sdlc_orchestrator run --offline --scenario greenfield \
     --requirement "Build a URL shortener with shorten, redirect, and click analytics" --non-interactive
+# the run pauses at the DESIGN gate (no code exists yet): approve, or send feedback / reject
+python -m sdlc_orchestrator resume <run_id> --offline --design-decision approve --approver you
+# ...then pauses at the RELEASE gate
 python -m sdlc_orchestrator resume <run_id> --offline --decision approve --approver you --rationale "smoke"
 
 # 2) real run: see TODO.md (Phase 2)
@@ -67,7 +70,7 @@ lives in its own git repository and never inside this one.
 
 ```mermaid
 flowchart LR
-    human(["Human reviewer<br/>(clarification + release gates)"])
+    human(["Human reviewer<br/>(clarification, design + release gates)"])
     subgraph orch["Orchestrator (this repo, Python / LangGraph)"]
         cli["CLI<br/>run | resume | audit | metrics"]
         engine["Stateful agent graph<br/>gates, retries, rollback, replan"]
@@ -114,20 +117,23 @@ flowchart TD
     req --> amb{ambiguities?}
     amb -- yes --> clar["clarification<br/>HUMAN GATE 1"]
     clar -- declined --> abort[abort]
-    clar -- resolved --> ws
-    amb -- no --> ws[workspace<br/>git init or branch run/id]
-    ws --> dec["decomposition<br/>task DAG + parallel waves"]
+    clar -- resolved --> workspace
+    amb -- no --> workspace[workspace<br/>git init or branch run/id]
+    workspace --> dec["decomposition<br/>task DAG + parallel waves"]
     dec --> bf{brownfield?}
     bf -- yes --> cbr["codebase_reasoning<br/>real inventory, paths verified"]
-    bf -- no --> des
-    cbr --> des["design<br/>OpenAPI + Flyway + component plan + ADRs"]
-    des --> scf["scaffold<br/>start.spring.io, idempotent"]
+    bf -- no --> design
+    cbr --> design["design<br/>design doc + OpenAPI + Flyway + component plan + ADRs"]
+    design --> dreview["design_review<br/>HUMAN GATE 2"]
+    dreview -- approve --> scf["scaffold<br/>start.spring.io, idempotent"]
+    dreview -- "revise (feedback)" --> design
+    dreview -- reject --> abort
     scf --> d["impl_data<br/>entities, repos, config, Docker"]
     scf --> a["impl_api<br/>controllers, services, security, tests"]
-    d --> qg
-    a --> qg{"quality_gate<br/>blocking policy checks"}
-    qg -- pass --> test["testing<br/>real mvnw test"]
-    qg -- fail --> rr1{retries left?}
+    d --> quality_gate
+    a --> quality_gate{"quality_gate<br/>blocking policy checks"}
+    quality_gate -- pass --> test["testing<br/>real mvnw test"]
+    quality_gate -- fail --> rr1{retries left?}
     test --> cls{result}
     cls -- pass --> commit["commit<br/>one commit per approved task"]
     cls -- "infra problem" --> abort
@@ -137,10 +143,10 @@ flowchart TD
     rr1 -- no --> rbk["rollback<br/>git reset --hard"]
     rb --> d
     rb --> a
-    rp --> des
+    rp --> design
     commit --> docs --> rel["release_readiness<br/>final gate + clean tree"]
     rel -- fail --> rbk
-    rel -- pass --> appr["approval<br/>HUMAN GATE 2"]
+    rel -- pass --> appr["approval<br/>HUMAN GATE 3"]
     appr -- approve --> fin["finalize<br/>ff-merge to main + tag"]
     appr -- reject --> fin
     appr -- rework_design --> rp
@@ -155,10 +161,10 @@ flowchart TD
     classDef bad fill:#FFCDD2,stroke:#B71C1C,stroke-width:2px,color:#111
     classDef good fill:#C8E6C9,stroke:#1B5E20,stroke-width:2px,color:#111
     classDef edge fill:#ECEFF1,stroke:#455A64,color:#111
-    class req,dec,cbr,des,scf,d,a,test,docs,ws agent
-    class clar,appr human
+    class req,dec,cbr,design,scf,d,a,test,docs,workspace agent
+    class clar,dreview,appr human
     class amb,bf,cls,rr1 decision
-    class qg,rel gate
+    class quality_gate,rel gate
     class rb,rp recover
     class abort,rbk bad
     class commit,fin good
@@ -187,7 +193,14 @@ sequenceDiagram
     C->>G: invoke(initial state)
     end
     rect rgb(227, 242, 253)
-    G->>L: requirements, design (validated JSON)
+    G->>L: requirements, design (validated JSON + design document)
+    end
+    rect rgb(255, 224, 178)
+    G-->>C: interrupt(design gate)
+    C-->>H: design document, PAUSED
+    H->>C: resume --design-decision approve (or revise + feedback)
+    end
+    rect rgb(227, 242, 253)
     G->>R: init repo, branch run/id, scaffold commit
     par impl_data branch
         G->>L: impl_data prompt
@@ -228,7 +241,9 @@ The failure class decides the response, so a wrong *design* is fixed by re-runni
 | `ContractTest` finds an unserved OpenAPI path | `contract` | **Replan** (as above) | `MAX_REPLANS` |
 | Full strategy failed twice | n/a | **Fallback** to the simpler strategy, workspace reset, disclosed in README/CHANGELOG | once |
 | Retries exhausted, or release gate fails | n/a | **Rollback**: `git reset --hard` to the last approved commit | n/a |
-| Human `rework_design` at release gate | n/a | **Replan** (`human_rejected_design`) | `MAX_REPLANS` |
+| Human `revise` at the design gate | n/a | Design re-runs with the feedback, back to the same gate (no code exists yet, so no reset) | Human-paced |
+| Human `reject` at the design gate | n/a | **Abort** before any code is generated | n/a |
+| Human `rework_design` at release gate | n/a | **Replan** (`human_rejected_design`), re-reviewed at the design gate | `MAX_REPLANS` |
 | LLM API error | n/a | Exponential backoff, then fail loudly | `LLM_MAX_ATTEMPTS` |
 | Model returns invalid JSON | n/a | One repair attempt, then fail loudly (never silently guessed) | 1 |
 
@@ -356,7 +371,8 @@ purely from these rows, so every number traces back to events.
 |---|---|---|---|
 | Node preconditions / postconditions | Around every node | Structural, automatic | Run fails loudly with an audit event |
 | Requirement ambiguity | After `requirements` | **Human** | Run pauses; declining aborts |
-| Design completeness | Inside `design` | Automatic, blocking | Retry Design once, then fail |
+| Design completeness (incl. the design document's required sections) | Inside `design` | Automatic, blocking | Retry Design once, then fail |
+| **Design approval** | After `design`, **before scaffold and any code generation** | **Human** (approve / reject / revise with feedback) | Reject aborts; revise re-runs Design with the feedback and returns to the gate |
 | Quality gate (secrets, validation, auth, OpenAPI = code, NFRs, tests present, migrations immutable) | After the parallel join, **before tests** | Automatic, blocking | Retry / rollback |
 | Real test suite | `testing` | Automatic, blocking | Classified: abort / replan / retry / rollback |
 | Release readiness | Before approval | Automatic, blocking | Rollback |
@@ -379,14 +395,14 @@ purely from these rows, so every number traces back to events.
 | Requirements | `requirements_agent.py` | Raw prompt → structured spec + **blocking ambiguity list** + **logged assumptions**; deterministic vagueness backstop (“make it more reliable”); merges the baseline NFRs |
 | Decomposition | `decomposition_agent.py` | Spec → **task DAG** with parallel branches + sync point; validated; logged canonical fallback; `replan_downstream()` |
 | Codebase reasoning | `codebase_reasoning_agent.py` | Brownfield impact analysis over a **real inventory**; every named path verified on disk |
-| Design | `design_agent.py` | OpenAPI contract + Flyway migrations + component plan + ADRs; blocking completeness gate; re-run with feedback on replan |
+| Design | `design_agent.py` | **Design document** (`docs/DESIGN.md`) + OpenAPI contract + Flyway migrations + component plan + ADRs; blocking completeness gate; re-run with feedback on replan or human revise |
 | Scaffold | `scaffold_agent.py` / `scaffold.py` | Real project from **start.spring.io** (latest GA Boot, asserts ≥ 4) + first approved commit |
 | CodeGen ×2 | `codegen_agent.py` | `impl_data` ∥ `impl_api`; strategies `full` / `simple` (fallback); safe path-checked writes |
 | Quality gate / commit | `quality_agent.py` | Blocking policy checks on the whole repo; one commit per approved task |
 | Test | `testing_agent.py` | Real Maven run, surefire parsing, failure classification |
-| Docs | `docs_agent.py` | README, CHANGELOG entry, ADR files — templated from state so they're accurate |
+| Docs | `docs_agent.py` | README, CHANGELOG entry, `docs/DESIGN.md` (the approved design document), ADR files — templated from state so they're accurate |
 | Release readiness | `release_agent.py` | Final gate + clean-tree check, then the human approval interrupt |
-| Control plane | `control.py` | Clarification & approval gates, retry/backoff/fallback, **git rollback**, **replan**, finalize/abort |
+| Control plane | `control.py` | Clarification, **design review** & release approval gates, retry/backoff/fallback, **git rollback**, **replan**, finalize/abort |
 
 ## Product requirements → where they are implemented
 
@@ -398,7 +414,7 @@ purely from these rows, so every number traces back to events.
 | Workflow orchestration (stateful, gated, observable) | `graph.py`, `contracts.py`, `stage.py`, checkpointer |
 | Engineering output generation | `codegen_agent.py` + `scaffold.py` |
 | Validation & risk control | `guardrails.py` (blocking), `testing_agent.py`, `failures.py` |
-| Controlled autonomy (human approval, identity/timestamp/rationale) | `control.py` (2 gates), `ApprovalRecord`; **no bypass flag exists** |
+| Controlled autonomy (human approval, identity/timestamp/rationale) | `control.py` (3 gates), `ApprovalRecord`; **no bypass flag exists** |
 | Bounded retries with backoff | `control.retry_bookkeeping_node`, `llm.invoke_llm` |
 | Fallback path | `FALLBACK_AFTER_FAILURES` → `simple` strategy (disclosed in README/CHANGELOG) |
 | Rollback tied to git | `gitops.py`, `control.rollback_node` (one commit per approved task) |
@@ -425,11 +441,11 @@ bounded everything (retries, replans, LLM attempts, Maven timeout) · determinis
 model output (DAG, design, paths, contract).
 
 ## Testing approach
-1. **Offline unit/integration suite (113 tests, ~10s, no infra):** routing predicates, DAG rules, guardrails,
+1. **Offline unit/integration suite (122 tests, ~10s, no infra):** routing predicates, DAG rules, guardrails,
    Java endpoint scanner, LLM backoff/JSON repair, git rollback on a real temp repo, metrics definitions,
    scaffold URL/zip safety, and **full-graph end-to-end runs** with a deterministic stub LLM covering every
    path: greenfield, brownfield-after-greenfield, ambiguous, retry, fallback, rollback, replan (+bounded),
-   infra abort, reject, rework-design, secret-blocking gate.
+   infra abort, reject, rework-design, secret-blocking gate, and the design gate (approve, reject, revise with feedback).
 2. **Live verification steps** in `TODO.md` — each prompt is exercised alone (`python -m sdlc_orchestrator.cli.dev ...`) before it is
    trusted in the full graph, then the real Maven suite is what finally accepts the generated code.
 

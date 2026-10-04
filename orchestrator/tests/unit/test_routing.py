@@ -3,7 +3,7 @@ Pure unit tests for the conditional-edge predicates in workflow/graph.py: no
 Postgres, no LLM, no Docker. The fastest feedback loop - run these first.
 """
 from sdlc_orchestrator.workflow.graph import (
-    route_after_approval, route_after_clarification, route_after_decomposition, route_after_quality,
+    route_after_approval, route_after_clarification, route_after_design_review, route_after_decomposition, route_after_quality,
     route_after_release_gate, route_after_requirements, route_after_testing,
 )
 
@@ -79,3 +79,11 @@ def test_release_gate_and_approval_routes():
     assert route_after_approval({"release_decision": "reject"}) == "finalize"
     assert route_after_approval({"release_decision": "rework_design", "replans": []}) == "replan"
     assert route_after_approval({"release_decision": "rework_design", "replans": [{}]}) == "finalize"
+
+
+def test_design_review_routes():
+    assert route_after_design_review({"design_decision": "approve"}) == "scaffold"
+    assert route_after_design_review({"design_decision": "revise"}) == "design"
+    assert route_after_design_review({"design_decision": "reject"}) == "abort"
+    assert route_after_design_review({}) == "abort"                       # no decision never proceeds to codegen
+    assert route_after_design_review({"design_decision": "yolo"}) == "abort"
