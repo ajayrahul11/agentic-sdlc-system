@@ -14,7 +14,8 @@ CLI for the agentic SDLC orchestrator.
     python -m sdlc_orchestrator audit   <run_id>             # who/what/when/why/outcome timeline
     python -m sdlc_orchestrator metrics <run_id> | --all
     python -m sdlc_orchestrator runs
-    python -m sdlc_orchestrator reset-target                 # delete the generated project (asks first)
+    python -m sdlc_orchestrator reset-target                 # delete the generated project (you must type its folder name)
+    python -m sdlc_orchestrator reset-target --archive       # same, but move it aside as a timestamped backup instead
 
 Add --offline (after the sub-command) to ANY command to use the deterministic stub LLM, a fake
 `mvn test`, SQLite checkpoints and a JSONL event log: no API key, no
@@ -26,6 +27,7 @@ import argparse
 import getpass
 import os
 import shutil
+from datetime import datetime
 import sys
 import uuid
 
@@ -262,6 +264,8 @@ def cmd_runs(args) -> int:
 
 
 def cmd_reset_target(args) -> int:
+    """Remove (or move aside) the generated project so a greenfield run can start again.
+    Never automatic and never silent: the human must type the folder name to confirm (a piped 'yes' is not enough)."""
     if args.offline:
         apply_offline()
     target = config.target_repo()
@@ -271,11 +275,18 @@ def cmd_reset_target(args) -> int:
     if not target.exists():
         rprint(f"{target} does not exist - nothing to do.")
         return 0
-    if input(f"This permanently deletes {target} (the generated project, incl. its git history). Type 'yes' to confirm: ").strip() != "yes":
-        rprint("Aborted.")
+    action = "MOVES ASIDE (keeps a backup of)" if args.archive else "PERMANENTLY DELETES"
+    rprint(f"This {action}:\n  {target}\n(the generated project, including its git history and any unpushed work).")
+    if input(f"Type the folder name '{target.name}' to confirm, anything else aborts: ").strip() != target.name:
+        rprint("Aborted. Nothing was changed.")
         return 1
-    shutil.rmtree(target)
-    rprint(f"Deleted {target}")
+    if args.archive:
+        backup = target.with_name(f"{target.name}.archived-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        shutil.move(str(target), str(backup))
+        rprint(f"Moved to {backup}")
+    else:
+        shutil.rmtree(target)
+        rprint(f"Deleted {target}")
     return 0
 
 
@@ -372,7 +383,8 @@ def main(argv: list[str] | None = None) -> int:
     sp = add("audit", cmd_audit); sp.add_argument("run_id"); sp.add_argument("--all", action="store_true")
     sp = add("metrics", cmd_metrics); sp.add_argument("run_id", help="run id, or --all")
     add("runs", cmd_runs)
-    add("reset-target", cmd_reset_target)
+    sp = add("reset-target", cmd_reset_target)
+    sp.add_argument("--archive", action="store_true", help="move the target aside (timestamped backup) instead of deleting it")
     add("doctor", cmd_doctor)
 
     args = p.parse_args(argv)

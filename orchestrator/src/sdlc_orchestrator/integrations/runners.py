@@ -127,13 +127,22 @@ def _stub_result() -> dict:
             "errors": 0, "skipped": 0, "failed_tests": [], "duration_s": 0.0}
 
 
+def maven_command(repo: Path) -> list[str]:
+    """The project's Maven wrapper (mvnw.cmd on Windows, ./mvnw elsewhere), else a system `mvn`."""
+    if os.name == "nt" and (repo / "mvnw.cmd").exists():
+        return [str(repo / "mvnw.cmd")]
+    if (repo / "mvnw").exists() and os.name != "nt":
+        return ["./mvnw"]
+    return ["mvn"]
+
+
 def run_maven_tests(repo: Path) -> dict:
     """Run the REAL test suite. Codegen output is never trusted on the
     model's word - only on `mvnw test` exiting 0 with tests actually run."""
     if config.stub_mode():
         return _stub_result()
 
-    cmd = ["./mvnw", "-B", "test"] if (repo / "mvnw").exists() else ["mvn", "-B", "test"]
+    cmd = maven_command(repo) + ["-B", "test"]
     started = time.monotonic()
     try:
         proc = subprocess.run(cmd, cwd=repo, env=maven_env(), capture_output=True, text=True, timeout=config.maven_timeout_seconds())

@@ -235,3 +235,44 @@ def test_reset_target_offline_refuses_a_non_sandbox_path(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda *_: "yes")
     assert cli.cmd_reset_target(SimpleNamespace(offline=True)) == 2
     assert real.exists()
+
+
+def test_reset_target_requires_the_folder_name_not_a_blanket_yes(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from sdlc_orchestrator.cli import main as cli
+
+    target = tmp_path / "url-shortener-service"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    monkeypatch.setenv("TARGET_REPO_PATH", str(target))
+    args = SimpleNamespace(offline=False, archive=False)
+    for wrong in ("yes", "y", "", "url-shortener"):
+        monkeypatch.setattr("builtins.input", lambda *_, w=wrong: w)
+        assert cli.cmd_reset_target(args) == 1 and (target / "keep.txt").exists()   # nothing is touched
+    monkeypatch.setattr("builtins.input", lambda *_: "url-shortener-service")
+    assert cli.cmd_reset_target(args) == 0 and not target.exists()
+
+
+def test_reset_target_archive_moves_the_project_aside_instead_of_deleting(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from sdlc_orchestrator.cli import main as cli
+
+    target = tmp_path / "url-shortener-service"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    monkeypatch.setenv("TARGET_REPO_PATH", str(target))
+    monkeypatch.setattr("builtins.input", lambda *_: "url-shortener-service")
+    assert cli.cmd_reset_target(SimpleNamespace(offline=False, archive=True)) == 0
+    backups = list(tmp_path.glob("url-shortener-service.archived-*"))
+    assert not target.exists() and len(backups) == 1 and (backups[0] / "keep.txt").read_text() == "x"
+
+
+def test_maven_command_uses_the_windows_wrapper_on_windows(monkeypatch, tmp_path):
+    from sdlc_orchestrator.integrations import runners
+
+    (tmp_path / "mvnw").write_text("")
+    (tmp_path / "mvnw.cmd").write_text("")
+    monkeypatch.setattr(runners.os, "name", "nt")
+    assert runners.maven_command(tmp_path) == [str(tmp_path / "mvnw.cmd")]
+    monkeypatch.setattr(runners.os, "name", "posix")
+    assert runners.maven_command(tmp_path) == ["./mvnw"]

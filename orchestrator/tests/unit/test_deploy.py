@@ -110,3 +110,15 @@ def test_openapi_config_is_canonical_and_declares_the_header_scheme():
     cfg = deploy.CANONICAL_OPENAPI_CONFIG
     assert 'name("X-API-Key")' in cfg and "SecurityScheme.In.HEADER" in cfg and "getPost()" in cfg
     assert deploy.OPENAPI_CONFIG_PATH.endswith("config/OpenApiConfig.java")
+
+
+def test_generated_readme_has_prerequisites_and_a_mac_and_windows_quick_start():
+    from sdlc_orchestrator.workflow.nodes.docs_agent import render_readme
+
+    state = {"run_id": "r", "requirement_spec": {"problem_statement": "p"},
+             "design_doc": {"api_contract": {"paths": {"/api/shorten": {"post": {}}}}, "configuration": {}, "adrs": []}}
+    readme = render_readme(state)
+    for needed in ("## Prerequisites", "## Quick start", "docker compose up --build", "$env:SHORTENER_API_KEY",
+                   "export SHORTENER_API_KEY", "swagger-ui/index.html", "Authorize", "mvnw.cmd", "docker compose down", "## Troubleshooting"):
+        assert needed in readme, needed
+    assert readme.index("## Prerequisites") < readme.index("## Quick start")
