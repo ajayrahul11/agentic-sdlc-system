@@ -33,6 +33,26 @@ REQUIRED_DEPS = ["web", "validation", "data-jpa", "data-redis", "postgresql", "f
 OPTIONAL_DEPS = ["testcontainers"]
 
 
+# springdoc is not an Initializr dependency; 3.1.x is the line built for Spring Boot 4.1. It serves the
+# OpenAPI spec at /v3/api-docs and the Swagger UI at /swagger-ui/index.html with no controller code.
+SPRINGDOC_VERSION = "3.1.1"
+SPRINGDOC_DEP = f"""    <dependency>
+      <groupId>org.springdoc</groupId>
+      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+      <version>{SPRINGDOC_VERSION}</version>
+    </dependency>
+"""
+
+
+def add_springdoc(repo: Path) -> bool:
+    pom = repo / "pom.xml"
+    text = pom.read_text()
+    if "springdoc-openapi" in text or "</dependencies>" not in text:
+        return False
+    pom.write_text(text.replace("</dependencies>", SPRINGDOC_DEP + "  </dependencies>", 1))
+    return True
+
+
 class ScaffoldError(RuntimeError):
     pass
 
@@ -137,7 +157,8 @@ def scaffold_project(repo: Path, boot_version: str | None = None) -> dict:
     files = extract_zip(_get(url, timeout=120), repo)
     version = assert_boot_major((repo / "pom.xml").read_text())
     removed = remove_generated_context_test(repo)
-    return {"boot_version": version, "dependencies": chosen, "skipped_optional": skipped,
+    springdoc = add_springdoc(repo)
+    return {"springdoc": springdoc, "boot_version": version, "dependencies": chosen, "skipped_optional": skipped,
             "files": len(files), "removed": removed, "url": url}
 
 

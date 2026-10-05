@@ -14,6 +14,7 @@ from langgraph.types import interrupt
 
 from sdlc_orchestrator.core import config
 from sdlc_orchestrator.integrations import gitops
+from sdlc_orchestrator.integrations.design_html import render_design_html
 from sdlc_orchestrator.core.events import log_event
 from sdlc_orchestrator.workflow.nodes.common import repo_path, set_task_status
 from sdlc_orchestrator.workflow.nodes.decomposition_agent import replan_downstream
@@ -49,8 +50,14 @@ def _sleep(seconds: float) -> None:  # patched in tests
 # Clarification gate (ambiguous requirements)
 # ---------------------------------------------------------------------------
 
+def clarification_rounds(state: dict) -> int:
+    """Times the human has already been asked (every answer is an approval record)."""
+    return sum(1 for a in state.get("approvals", []) if a.get("gate") == "clarification")
+
+
 def _clarification_request(state: dict) -> dict:
     log_event(state["run_id"], "clarification", "approval_requested", {
+        "round": clarification_rounds(state) + 1, "max_rounds": config.max_clarification_rounds(),
         "ambiguities": state.get("ambiguities", []), "assumptions": state.get("assumptions", [])},
         actor="system:requirements", outcome="pending",
         reason="blocking ambiguities - the system will not guess")
@@ -63,29 +70,59 @@ clarification_request_node = stage("clarification_request", actor="system:requir
 def clarification_node(state: dict) -> dict:
     """Human gate. Resume value:
     {"resolution": str, "approver": str, "proceed": bool=True}
-    Empty resolution = 'accept the logged assumptions as stated'."""
+    A non-empty resolution loops back to Requirements, which re-analyses the
+    request plus all answers so far and may ask again, up to
+    MAX_CLARIFICATION_ROUNDS. Empty resolution = 'accept the logged
+    assumptions as stated' (ends the loop). proceed=False aborts."""
+    rnd, cap = clarification_rounds(state) + 1, config.max_clarification_rounds()
     decision = interrupt({
         "gate": "clarification",
+        "round": rnd, "max_rounds": cap,
         "ambiguities": state.get("ambiguities", []),
         "assumptions": state.get("assumptions", []),
-        "prompt": "Answer the ambiguities (or accept the listed assumptions) to proceed.",
+        "prompt": ("Answer the ambiguities (or accept the listed assumptions) to proceed."
+                   + (" This is the LAST round: anything still unclear afterwards proceeds as a logged assumption."
+                      if rnd >= cap else "")),
     }) or {}
     approver = decision.get("approver") or "unknown"
     proceed = decision.get("proceed", True)
-    resolution = (decision.get("resolution") or "").strip() or "ACCEPTED the logged assumptions as stated"
+    answer = (decision.get("resolution") or "").strip()
+    kind = "decline" if not proceed else ("answered" if answer else "accept")
+    resolution = answer or "ACCEPTED the logged assumptions as stated"
 
-    record = ApprovalRecord(gate="clarification", decision="resolved" if proceed else "reject",
+    record = ApprovalRecord(gate="clarification", decision="reject" if kind == "decline" else "resolved",
                             approver=approver, rationale=resolution)
-    log_event(state["run_id"], "clarification", "approval_granted" if proceed else "approval_rejected",
-              {"resolution": resolution}, actor=f"human:{approver}", outcome="resolved" if proceed else "reject",
-              reason=resolution[:300])
-    if not proceed:
-        return {"approvals": [dump(record)], "abort_reason": "clarification declined by human", "status": "failed"}
+    log_event(state["run_id"], "clarification", "approval_rejected" if kind == "decline" else "approval_granted",
+              {"resolution": resolution, "round": rnd, "kind": kind}, actor=f"human:{approver}",
+              outcome=record.decision, reason=resolution[:300])
+    if kind == "decline":
+        return {"approvals": [dump(record)], "clarification_decision": kind,
+                "abort_reason": "clarification declined by human", "status": "failed"}
 
+    delta: dict = {"approvals": [dump(record)], "clarification_decision": kind, "status": "running"}
+    if kind == "answered":
+        delta["clarification_answers"] = [*state.get("clarification_answers", []), answer]
+    return delta
+
+
+def _assume_unresolved(state: dict) -> dict:
+    """Close the clarification loop without guessing silently: every still-open
+    question becomes an explicit, flagged assumption (shown again at the design gate)."""
+    cap = config.max_clarification_rounds()
+    accepted = state.get("clarification_decision") == "accept"
+    why = ("human accepted the logged assumptions" if accepted
+           else f"clarification cap reached ({cap} rounds)")
+    notes = [f"UNRESOLVED - proceeding on assumption: {q}" for q in state.get("ambiguities", [])]
     spec = dict(state.get("requirement_spec", {}))
-    spec["clarification_resolution"] = resolution
-    spec["requirements_after_clarification"] = f"{state['raw_requirement']}\n\nCLARIFICATION: {resolution}"
-    return {"approvals": [dump(record)], "requirement_spec": spec, "ambiguities_resolved": True, "status": "running"}
+    spec["unresolved_assumptions"] = notes
+    log_event(state["run_id"], "clarification", "assumed_unresolved", {"questions": state.get("ambiguities", []), "why": why},
+              actor="system:orchestrator", outcome="assumed", reason=why)
+    return {"assumptions": [*state.get("assumptions", []), *notes], "requirement_spec": spec,
+            "ambiguities_resolved": True, "status": "running", "_outcome": "assumed", "_reason": why,
+            "_detail": {"unresolved": len(notes)}}
+
+
+assume_unresolved_node = stage("assume_unresolved", actor="system:orchestrator")(_assume_unresolved)
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +138,11 @@ def _design_review_request(state: dict) -> dict:
     design = state.get("design_doc", {})
     review_file = config.runs_dir() / run_id / "DESIGN.md"
     review_file.parent.mkdir(parents=True, exist_ok=True)
-    review_file.write_text(design.get("design_document", ""))
+    open_items = state.get("requirement_spec", {}).get("unresolved_assumptions", [])
+    banner = ("> **Unresolved requirement questions - decided by assumption, please check:**\n"
+              + "".join(f"> - {a}\n" for a in open_items) + "\n") if open_items else ""
+    review_file.write_text(banner + design.get("design_document", ""))
+    review_file.with_suffix(".html").write_text(render_design_html(banner + design.get("design_document", "")))
     log_event(run_id, "design_review", "approval_requested", {
         "revision": design_revisions(state), "review_file": str(review_file),
         "endpoints": sorted(design.get("api_contract", {}).get("paths", {}).keys())},
@@ -121,8 +162,12 @@ def design_review_node(state: dict) -> dict:
     design = state.get("design_doc", {})
     decision = interrupt({
         "gate": "design",
-        "prompt": "Review the design. approve / reject / revise (revise needs feedback)",
+        "prompt": ("Review the design. approve / reject / revise (revise needs feedback)"
+                   + (" - FINAL review: revise is no longer available, a design that is not approved is rejected"
+                      if design_revisions(state) >= config.max_design_revisions() else "")),
         "revision": design_revisions(state),
+        "revisions_remaining": max(0, config.max_design_revisions() - design_revisions(state)),
+        "unresolved_assumptions": state.get("requirement_spec", {}).get("unresolved_assumptions", []),
         "design_document": design.get("design_document", ""),
         "endpoints": sorted(design.get("api_contract", {}).get("paths", {}).keys()),
         "migrations": [f"V{m.get('version')}__{m.get('name')}" for m in design.get("migrations", [])],
@@ -136,6 +181,12 @@ def design_review_node(state: dict) -> dict:
         d = "reject"  # unknown input never approves
     approver = decision.get("approver") or "unknown"
 
+    cap = config.max_design_revisions()
+    capped = d == "revise" and design_revisions(state) >= cap
+    if capped:  # revision budget spent: a design that cannot be approved never loops forever
+        feedback = f"revision cap ({cap}) reached; last feedback: {feedback or 'none'}"
+        d = "reject"
+
     record = ApprovalRecord(gate="design", decision=d, approver=approver, rationale=feedback)
     log_event(state["run_id"], "design_review", "approval_granted" if d == "approve" else "approval_rejected",
               {"decision": d, "revision": design_revisions(state)}, actor=f"human:{approver}", outcome=d,
@@ -143,7 +194,8 @@ def design_review_node(state: dict) -> dict:
 
     delta: dict = {"approvals": [dump(record)], "design_decision": d, "status": "running"}
     if d == "reject":
-        delta.update({"abort_reason": f"design rejected by human ({approver})" + (f": {feedback[:200]}" if feedback else ""),
+        delta.update({"abort_reason": (f"design not approved after {cap} revisions ({approver}): {feedback[:200]}" if capped else
+                                       f"design rejected by human ({approver})" + (f": {feedback[:200]}" if feedback else "")),
                       "status": "failed"})
     elif d == "revise":
         delta["design_feedback"] = (

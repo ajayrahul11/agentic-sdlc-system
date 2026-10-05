@@ -28,8 +28,10 @@ from __future__ import annotations
 import json
 import yaml
 
+from sdlc_orchestrator.core import config
 from sdlc_orchestrator.core.events import log_event
-from sdlc_orchestrator.llm.client import invoke_llm
+from sdlc_orchestrator.integrations import deploy
+from sdlc_orchestrator.llm.client import invoke_llm, model_for
 from sdlc_orchestrator.workflow.nodes.common import repo_path, set_task_status
 from sdlc_orchestrator.integrations.repo_io import parse_deletes, parse_file_blocks, read_repo_files, write_files
 from sdlc_orchestrator.workflow.stage import stage
@@ -42,7 +44,7 @@ Paths are relative to the REPOSITORY ROOT:
 ===END===
 
 Every file must be COMPLETE (never a diff, never "...rest unchanged..."). Allowed locations: src/**, \
-Dockerfile, docker-compose.yml, .dockerignore, pom.xml (data branch only).
+docker-compose.yml, pom.xml (data branch only).
 To REMOVE a file that you created in an earlier attempt, emit a line: ===DELETE: path/to/file==="""
 
 COMMON_RULES = """You are a senior Java engineer writing a Spring Boot 4 / Java 21 URL shortener. The Maven project \
@@ -65,9 +67,15 @@ NON-NEGOTIABLE requirements (an automated gate blocks the build if any is missin
 3. Every @RequestBody parameter is annotated @Valid, and the request DTO uses jakarta.validation constraints \
 (URL must be http/https, max 2048 chars; alias pattern ^[A-Za-z0-9_-]{3,32}$).
 4. Mutating endpoints (POST/PUT/PATCH/DELETE) require authentication: a SecurityFilterChain with stateless sessions, \
-csrf disabled, GET redirect/health/info permitted, everything else .authenticated(), authenticating an X-API-Key \
+csrf disabled, GET redirect/health/info AND the API docs (/v3/api-docs/**, /swagger-ui/**, /swagger-ui.html) permitted, \
+everything else .authenticated(), authenticating an X-API-Key \
 header against property app.security.api-key (from env SHORTENER_API_KEY - NEVER a literal secret, no default value).
 5. No secrets in code or config (${ENV_VAR} placeholders only); no System.out / printStackTrace (SLF4J); no wildcard CORS.
+5b. springdoc-openapi (already in the pom) serves the live OpenAPI spec at /v3/api-docs and Swagger UI at \
+/swagger-ui/index.html; do NOT write controllers for them and do not exclude them from the rate limiter's allow path logic. \
+ContractTest and other tests must not treat them as undeclared operations.
+5c. The Flyway migrations in the design are the ONLY database schema. Every table and column name in entities, \
+repositories and hand-written SQL (JdbcClient/@Query/native) MUST match them character for character - never invent a table.
 6. Use EXACTLY the property names from design.configuration.
 7. Errors are RFC 7807 ProblemDetail: 400 validation, 401, 404 unknown code, 410 expired link, 429 rate limited \
 (with Retry-After).
@@ -101,10 +109,11 @@ runs with ddl-auto=validate, so any mismatch fails at startup)
 - configuration classes the design assigns to this branch (JPA/Redis/properties record @ConfigurationProperties)
 - src/main/resources/application.yml: env-var driven datasource/redis/flyway config, spring.jpa.hibernate.ddl-auto: validate, \
 actuator health/info/metrics exposed, all design.configuration properties
-- Dockerfile (multi-stage Maven build -> slim JRE 21 runtime, non-root user) and docker-compose.yml \
-(services: app, postgres, redis with healthchecks; app configured via environment, SHORTENER_API_KEY from env)
-- .dockerignore
-DO NOT write: Flyway migration files or docs/openapi.yaml (the orchestrator writes them verbatim from the design), \
+- docker-compose.yml (services: app, postgres, redis with healthchecks; app built from ./Dockerfile, published on host port \
+8080; app configured ONLY via environment variables that application.yml reads - DB_URL, DB_USERNAME, DB_PASSWORD, REDIS_HOST, \
+SHORTENER_API_KEY, APP_BASE_URL - with DB_PASSWORD and SHORTENER_API_KEY taken from the host env and no secret literals). It is \
+verified by really running `docker compose up --build` and calling the live APIs, so every variable the app needs must be set.
+DO NOT write: Dockerfile, .dockerignore or config/OpenApiConfig.java (the orchestrator provides the Swagger X-API-Key scheme), Flyway migration files or docs/openapi.yaml (the orchestrator writes them verbatim), \
 controllers, services, DTOs, security, filters, or tests.""",
     "impl_api": """BRANCH: impl_api (API layer + tests). You own and must write:
 - DTOs (records with validation), services, controllers, GlobalExceptionHandler (ProblemDetail), SecurityFilterChain + \
@@ -131,6 +140,9 @@ def _write_deterministic(repo, design: dict) -> dict[str, str]:
     for m in design.get("migrations", []):
         files[f"src/main/resources/db/migration/V{int(m['version'])}__{m['name']}.sql"] = m["sql"].rstrip() + "\n"
     files["docs/openapi.yaml"] = yaml.safe_dump(design["api_contract"], sort_keys=False)
+    files["Dockerfile"] = deploy.CANONICAL_DOCKERFILE      # build recipe is boilerplate: written by the orchestrator, not the model
+    files[".dockerignore"] = deploy.CANONICAL_DOCKERIGNORE
+    files[deploy.OPENAPI_CONFIG_PATH] = deploy.CANONICAL_OPENAPI_CONFIG   # Swagger UI "Authorize" (X-API-Key)
     return files
 
 
@@ -160,17 +172,20 @@ def _existing_context(repo, state: dict, budget: int = 60_000) -> str:
     return "\n\n".join(out)
 
 
-def build_prompts(state: dict, branch: str, repo) -> tuple[str, str]:
+def build_prompt_parts(state: dict, branch: str, repo) -> tuple[str, str, str]:
+    """(system, stable_prefix, variable_suffix). The prefix (design + this branch's
+    components) is identical across retries of a branch, so it is prompt-cached; the
+    suffix carries everything that changes per attempt (pom, existing files, failures)."""
     strategy = (state.get("codegen_strategy") or "full")
     design = state["design_doc"]
     system = "\n\n".join([COMMON_RULES, FULL_STRATEGY if strategy == "full" else SIMPLE_STRATEGY, BRANCH_SCOPE[branch], OUTPUT_FORMAT])
 
-    parts = [
+    prefix = "\n\n".join([
         f"MODE: {state.get('mode', 'greenfield')}",
-        "POM.XML (current):\n" + ((repo / "pom.xml").read_text() if (repo / "pom.xml").exists() else "(missing)"),
-        "DESIGN:\n" + json.dumps({k: design.get(k) for k in ("api_contract", "component_plan", "configuration", "adrs")}, indent=1),
+        "DESIGN:\n" + json.dumps({k: design.get(k) for k in ("api_contract", "component_plan", "configuration", "adrs", "migrations")}, indent=1),
         f"YOUR COMPONENTS ({branch}):\n" + json.dumps(_select_components(design, branch), indent=1),
-    ]
+    ])
+    parts = ["POM.XML (current):\n" + ((repo / "pom.xml").read_text() if (repo / "pom.xml").exists() else "(missing)")]
     if state.get("mode") == "brownfield":
         parts.append("EXISTING FILES TO MODIFY (output the COMPLETE new version of each file you change):\n" + _existing_context(repo, state))
         parts.append("Preserve all existing behaviour and tests; only add/modify what the requirement needs.")
@@ -184,7 +199,24 @@ def build_prompts(state: dict, branch: str, repo) -> tuple[str, str]:
         else:
             parts.append("A PREVIOUS ATTEMPT FAILED and the workspace was reset to the clean scaffold. Regenerate ALL files for "
                          f"your branch from scratch, avoiding the cause.\nFAILURE OUTPUT:\n{feedback}")
-    return system, "\n\n".join(parts)
+    return system, prefix, "\n\n".join(parts)
+
+
+def build_prompts(state: dict, branch: str, repo) -> tuple[str, str]:
+    system, prefix, suffix = build_prompt_parts(state, branch, repo)
+    return system, f"{prefix}\n\n{suffix}"
+
+
+def failed_attempts(state: dict) -> int:
+    """Failed implementation attempts in the current plan version."""
+    pv = state.get("plan_version", 1)
+    return sum(1 for r in state.get("retries", []) if r.get("plan_version", 1) == pv)
+
+
+def _model_for_attempt(state: dict) -> tuple[str, bool]:
+    """Cheaper model first; the stronger one once an attempt has failed."""
+    escalated = failed_attempts(state) >= config.escalate_after_failures()
+    return model_for("codegen", escalated=escalated), escalated
 
 
 def _run_branch(state: dict, branch: str) -> dict:
@@ -201,14 +233,19 @@ def _run_branch(state: dict, branch: str) -> dict:
     components = _select_components(design, branch)
     generated: dict[str, str] = {}
     if components or state.get("failure_feedback"):
-        system, user = build_prompts(state, branch, repo)
-        text = invoke_llm("codegen", system, user, run_id=run_id)
+        system, prefix, suffix = build_prompt_parts(state, branch, repo)
+        model, escalated = _model_for_attempt(state)
+        if escalated and model != model_for("codegen"):
+            log_event(run_id, branch, "model_escalation", {"model": model, "failed_attempts": failed_attempts(state)},
+                      actor="system:orchestrator", outcome="escalated",
+                      reason=f"{failed_attempts(state)} failed attempt(s); codegen moved to the stronger model")
+        text = invoke_llm("codegen", system, suffix, run_id=run_id, cache_prefix=prefix, model=model)
         generated, problems = parse_file_blocks(text)
         errors += problems
 
         # ownership discipline: the data branch must not emit tests/controllers etc. and vice versa
         for path in list(generated):
-            if branch == "impl_data" and (path.startswith("src/test/") or "/web/" in path or path.endswith("/openapi.yaml") or "/db/migration/" in path):
+            if branch == "impl_data" and (path in ("Dockerfile", ".dockerignore", deploy.OPENAPI_CONFIG_PATH) or path.startswith("src/test/") or "/web/" in path or path.endswith("/openapi.yaml") or "/db/migration/" in path):
                 errors.append(f"{branch} emitted a file it does not own: {path}")
                 generated.pop(path)
             if branch == "impl_api" and (path in ("pom.xml", "Dockerfile", "docker-compose.yml") or path.startswith("src/main/resources/")):

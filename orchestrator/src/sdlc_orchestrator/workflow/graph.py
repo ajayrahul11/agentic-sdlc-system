@@ -5,10 +5,14 @@ differentiator"): an explicit, stateful, gated dependency graph.
                       requirements
                             |
               ambiguities?--+--no--------------------+
-                   | yes                             |
+                   | yes, rounds < MAX_CLARIFICATION_ROUNDS
         clarification_request                        |
                    |                                 |
           clarification (HUMAN GATE #1)  --declined--> abort
+            | answered: loop back to requirements    |
+            | accepted / round cap hit               |
+            v                                        |
+      assume_unresolved (open questions -> flagged assumptions)
                    |                                 |
                    +-----------------> workspace <---+   (git init / branch)
                                            |
@@ -20,7 +24,7 @@ differentiator"): an explicit, stateful, gated dependency graph.
    |                                       |                               |
    |                          design_review_request                        |
    |                                       |                               |
-   |       revise (feedback) <-- design_review (HUMAN GATE #2) --reject--> abort
+   |  revise (<= MAX_DESIGN_REVISIONS) <-- design_review (HUMAN GATE #2) --reject/cap--> abort
    |                                       | approve                       |
    |                                    scaffold  (greenfield; idempotent) |
    |                              +--------+--------+   PARALLEL FAN-OUT   |
@@ -55,7 +59,7 @@ from sdlc_orchestrator.core.failures import REPLAN_CLASSES
 from sdlc_orchestrator.workflow.nodes.codebase_reasoning_agent import codebase_reasoning_node
 from sdlc_orchestrator.workflow.nodes.codegen_agent import impl_api_node, impl_data_node
 from sdlc_orchestrator.workflow.nodes.control import (
-    abort_node, approval_node, clarification_node, clarification_request_node, design_review_node,
+    abort_node, approval_node, assume_unresolved_node, clarification_node, clarification_rounds, clarification_request_node, design_review_node,
     design_review_request_node, finalize_node, replan_node, replans_remaining, retries_in_epoch, retry_bookkeeping_node, rollback_node,
 )
 from sdlc_orchestrator.workflow.nodes.decomposition_agent import decomposition_node
@@ -75,11 +79,17 @@ from sdlc_orchestrator.core.state import OrchestratorState
 # ---------------------------------------------------------------------------
 
 def route_after_requirements(state: dict) -> str:
-    return "clarification_request" if state.get("ambiguities") else "workspace"
+    if not state.get("ambiguities"):
+        return "workspace"
+    # ask again only while the round budget lasts; otherwise proceed on logged assumptions
+    return "clarification_request" if clarification_rounds(state) < config.max_clarification_rounds() else "assume_unresolved"
 
 
 def route_after_clarification(state: dict) -> str:
-    return "workspace" if state.get("ambiguities_resolved") else "abort"
+    d = state.get("clarification_decision")
+    if d == "answered":
+        return "requirements"          # re-analyse request + answers; may ask again (bounded)
+    return "assume_unresolved" if d == "accept" else "abort"   # anything unknown never proceeds
 
 
 def route_after_decomposition(state: dict) -> str:
@@ -137,6 +147,7 @@ def build_graph(checkpointer):
         ("requirements", requirements_node),
         ("clarification_request", clarification_request_node),
         ("clarification", clarification_node),
+        ("assume_unresolved", assume_unresolved_node),
         ("workspace", workspace_node),
         ("decomposition", decomposition_node),
         ("codebase_reasoning", codebase_reasoning_node),
@@ -162,9 +173,12 @@ def build_graph(checkpointer):
 
     g.set_entry_point("requirements")
     g.add_conditional_edges("requirements", route_after_requirements,
-                            {"clarification_request": "clarification_request", "workspace": "workspace"})
+                            {"clarification_request": "clarification_request", "assume_unresolved": "assume_unresolved",
+                             "workspace": "workspace"})
     g.add_edge("clarification_request", "clarification")
-    g.add_conditional_edges("clarification", route_after_clarification, {"workspace": "workspace", "abort": "abort"})
+    g.add_conditional_edges("clarification", route_after_clarification,
+                            {"requirements": "requirements", "assume_unresolved": "assume_unresolved", "abort": "abort"})
+    g.add_edge("assume_unresolved", "workspace")
     g.add_edge("workspace", "decomposition")
     g.add_conditional_edges("decomposition", route_after_decomposition,
                             {"codebase_reasoning": "codebase_reasoning", "design": "design"})

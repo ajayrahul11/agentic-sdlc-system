@@ -82,6 +82,7 @@ def compute_metrics(events: list[dict]) -> dict:
         "recovered_failure_episodes": len(episodes),
         "unrecovered_failures": unrecovered,
         "llm_calls": len(llm),
+        "llm_cost_usd": round(sum((e["detail"].get("cost_usd") or 0.0) for e in llm), 4),
         "input_tokens": sum((e["detail"].get("input_tokens") or 0) for e in llm),
         "output_tokens": sum((e["detail"].get("output_tokens") or 0) for e in llm),
         "stage_time_ms": stage_ms,

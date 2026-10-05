@@ -227,8 +227,8 @@ def check_migrations_immutable(changes: list[tuple[str, str]]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 REQUIRED_DESIGN_DOC_SECTIONS = ("Overview", "Architecture", "Data model", "API design", "Key flows",
-                                "Caching and consistency", "Scalability", "Security", "Failure modes",
-                                "Trade-offs")
+                                "Sequence diagram", "Caching and consistency", "Scalability", "Security",
+                                "Failure modes", "Risks", "Trade-offs")
 
 
 def check_design_completeness(design: dict, mode: str, existing_contract: dict | None = None,
@@ -280,7 +280,7 @@ def check_design_completeness(design: dict, mode: str, existing_contract: dict |
         failures.append("design: design_document (markdown design doc for human review) is missing")
     elif mode == "greenfield":
         for section in REQUIRED_DESIGN_DOC_SECTIONS:
-            if not re.search(rf"^##\s+{re.escape(section)}\b", doc, re.IGNORECASE | re.MULTILINE):
+            if not re.search(rf"^##\s+[^\w\n]*{re.escape(section)}", doc, re.IGNORECASE | re.MULTILINE):
                 failures.append(f"design: design_document is missing the '## {section}' section")
 
     adr_text = " ".join(

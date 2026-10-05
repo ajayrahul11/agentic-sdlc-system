@@ -45,6 +45,14 @@ Client -> Spring Web controllers -> service layer -> Postgres (source of truth) 
 ## Key flows
 Shorten: validate -> next counter -> base62 -> persist -> cache. Redirect: cache-aside read, async click increment. Expiry: 410 once `expires_at` passes.
 
+## Sequence diagrams
+```mermaid
+sequenceDiagram
+    Client->>API: GET /abc
+    API->>Redis: lookup
+    API-->>Client: 302
+```
+
 ## Caching and consistency
 Strong consistency for the mapping, eventual for click counts (Redis write-behind flushed every 5s).
 
@@ -56,6 +64,11 @@ API key on mutating endpoints; per-IP fixed-window rate limit in Redis; URL sche
 
 ## Failure modes
 Redis down: redirects fall back to Postgres, analytics degrade. Counter loss: reseed from max(id).
+
+## Risks
+| risk | likelihood | impact | mitigation |
+|---|---|---|---|
+| Redis outage | 🟡 | 🟡 | Postgres fallback |
 
 ## Trade-offs and open questions
 Counter IDs are guessable; a hash alternative was rejected for collision handling.
@@ -120,7 +133,6 @@ def _java_files(branch: str, strategy: str, mode: str, inject_secret: bool = Fal
         files[f"{BASE}/repository/UrlMappingRepository.java"] = "package com.rahul.urlshortener.repository;\npublic interface UrlMappingRepository extends org.springframework.data.jpa.repository.JpaRepository<com.rahul.urlshortener.domain.UrlMapping, Long> {}\n"
         files["src/main/resources/application.yml"] = ("spring:\n  datasource:\n    url: ${DB_URL}\n    username: ${DB_USER}\n    password: ${DB_PASSWORD}\n  jpa:\n    hibernate:\n      ddl-auto: validate\n"
                                                       "management:\n  endpoints:\n    web:\n      exposure:\n        include: health,info,metrics\napp:\n  security:\n    api-key: ${SHORTENER_API_KEY}\n")
-        files["Dockerfile"] = "FROM eclipse-temurin:21-jre\nUSER 1000\nCOPY target/*.jar app.jar\nENTRYPOINT [\"java\",\"-jar\",\"/app.jar\"]\n"
         files["docker-compose.yml"] = "services:\n  app:\n    build: .\n    environment:\n      SHORTENER_API_KEY: ${SHORTENER_API_KEY}\n"
         return files
 

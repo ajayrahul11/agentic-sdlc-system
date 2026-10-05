@@ -4,6 +4,7 @@ import io
 
 import pytest
 
+from sdlc_orchestrator.core import config
 from sdlc_orchestrator.workflow import contracts
 from sdlc_orchestrator.workflow import dag
 from sdlc_orchestrator.integrations import scaffold
@@ -194,3 +195,43 @@ def test_generated_context_test_is_removed(tmp_path):
     t.mkdir(parents=True)
     (t / "UrlShortenerApplicationTests.java").write_text("x")
     assert scaffold.remove_generated_context_test(tmp_path) == ["src/test/java/x/UrlShortenerApplicationTests.java"]
+
+
+def test_stale_java_home_is_dropped_for_maven_when_path_jdk_is_new_enough(monkeypatch):
+    """Regression: JAVA_HOME pointed at JDK 17 while JDK 21 was on PATH, so ./mvnw failed with
+    'release version 21 not supported'."""
+    from sdlc_orchestrator.integrations import runners
+
+    monkeypatch.setenv("JAVA_HOME", "/old/jdk17")
+    monkeypatch.setenv("JAVA_VERSION", "21")
+    monkeypatch.setattr(runners, "java_home_major", lambda: 17)
+    monkeypatch.setattr(runners, "java_major", lambda: 21)
+    assert "JAVA_HOME" not in runners.maven_env()
+    monkeypatch.setattr(runners, "java_major", lambda: 17)       # PATH JDK is old too: leave the env alone
+    assert runners.maven_env()["JAVA_HOME"] == "/old/jdk17"
+    monkeypatch.setattr(runners, "java_home_major", lambda: 21)  # JAVA_HOME fine: untouched
+    monkeypatch.setattr(runners, "java_major", lambda: 17)
+    assert runners.maven_env()["JAVA_HOME"] == "/old/jdk17"
+
+
+def test_offline_mode_forces_the_sandbox_target_even_when_env_points_at_the_real_project(monkeypatch):
+    """Regression: `.env` sets TARGET_REPO_PATH to the real generated project; offline mode used setdefault, kept it,
+    and `reset-target --offline` deleted the real project."""
+    from sdlc_orchestrator.cli import main as cli
+
+    monkeypatch.setenv("TARGET_REPO_PATH", "../url-shortener-service")
+    monkeypatch.delenv("OFFLINE_TARGET_REPO_PATH", raising=False)
+    cli.apply_offline()
+    assert ".offline-target" in config.target_repo().parts
+
+
+def test_reset_target_offline_refuses_a_non_sandbox_path(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from sdlc_orchestrator.cli import main as cli
+
+    real = tmp_path / "url-shortener-service"
+    real.mkdir()
+    monkeypatch.setattr(cli, "apply_offline", lambda: monkeypatch.setenv("TARGET_REPO_PATH", str(real)))
+    monkeypatch.setattr("builtins.input", lambda *_: "yes")
+    assert cli.cmd_reset_target(SimpleNamespace(offline=True)) == 2
+    assert real.exists()

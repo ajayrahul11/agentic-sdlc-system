@@ -17,8 +17,26 @@ def test_requirements_routes_to_clarification_only_with_ambiguities():
     assert route_after_requirements({"ambiguities": ["what is reliable?"]}) == "clarification_request"
 
 
-def test_clarification_declined_aborts():
-    assert route_after_clarification({"ambiguities_resolved": True}) == "workspace"
+def test_clarification_loop_is_capped_then_proceeds_on_assumptions(monkeypatch):
+    monkeypatch.setenv("MAX_CLARIFICATION_ROUNDS", "2")
+    asked = lambda n: {"ambiguities": ["?"], "approvals": [{"gate": "clarification"}] * n}
+    assert route_after_requirements(asked(0)) == "clarification_request"
+    assert route_after_requirements(asked(1)) == "clarification_request"
+    assert route_after_requirements(asked(2)) == "assume_unresolved"     # cap hit: never ask a 3rd time
+    assert route_after_requirements({"ambiguities": [], "approvals": [{"gate": "clarification"}] * 2}) == "workspace"
+
+
+def test_cap_cannot_be_configured_to_zero(monkeypatch):
+    monkeypatch.setenv("MAX_CLARIFICATION_ROUNDS", "0")
+    monkeypatch.setenv("MAX_DESIGN_REVISIONS", "-3")
+    from sdlc_orchestrator.core import config
+    assert config.max_clarification_rounds() == 1 and config.max_design_revisions() == 1
+
+
+def test_clarification_routes_by_decision():
+    assert route_after_clarification({"clarification_decision": "answered"}) == "requirements"
+    assert route_after_clarification({"clarification_decision": "accept"}) == "assume_unresolved"
+    assert route_after_clarification({"clarification_decision": "decline"}) == "abort"
     assert route_after_clarification({}) == "abort"
 
 

@@ -124,6 +124,39 @@ def test_declined_clarification_aborts(offline_env):
     assert not config.target_repo().exists()
 
 
+def test_unresolving_answers_loop_until_cap_then_proceed_on_assumptions(offline_env, monkeypatch):
+    monkeypatch.setenv("MAX_CLARIFICATION_ROUNDS", "2")
+    values, gates = run("ambiguous", "make it better", approve=APPROVE,
+                        clarification={"resolution": "just generally better", "approver": "rahul"})
+    assert gates == ["clarification", "clarification", "design", "release"]   # asked twice, never a third time
+    assert values["status"] == "succeeded"
+    assert len(values["clarification_answers"]) == 2
+    assert any(a.startswith("UNRESOLVED") for a in values["assumptions"])
+    assert "assumed_unresolved" in types(offline_env)
+
+
+def test_answer_that_resolves_ends_the_loop_early(offline_env):
+    values, gates = run("ambiguous", "make it better", approve=APPROVE,
+                        clarification={"resolution": "99.9% availability, redirect p99 < 50ms", "approver": "rahul"})
+    assert gates == ["clarification", "design", "release"]
+    assert not any(a.startswith("UNRESOLVED") for a in values["assumptions"])
+
+
+def test_accepting_assumptions_proceeds_without_another_round(offline_env):
+    values, gates = run("ambiguous", "make it better", approve=APPROVE, clarification={"approver": "rahul"})
+    assert gates == ["clarification", "design", "release"]
+    assert any(a.startswith("UNRESOLVED") for a in values["assumptions"])
+
+
+def test_design_revisions_are_capped_and_then_abort(offline_env, monkeypatch):
+    monkeypatch.setenv("MAX_DESIGN_REVISIONS", "2")
+    values, gates = run("greenfield", GREEN, design={"decision": "revise", "feedback": "tweak it", "approver": "rahul"})
+    assert gates == ["design"] * 3                      # initial review + 2 revisions, then the cap
+    assert values["status"] == "failed"
+    assert "not approved after 2 revisions" in values["abort_reason"]
+    assert not (config.target_repo() / "pom.xml").exists()   # scaffold/codegen never ran
+
+
 def test_parallel_branches_and_sync_point_in_plan(offline_env):
     values, _ = run("greenfield", GREEN, approve=APPROVE)
     waves = values["plan_waves"]

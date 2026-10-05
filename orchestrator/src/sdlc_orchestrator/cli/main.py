@@ -40,12 +40,17 @@ from rich.table import Table  # noqa: E402
 from sdlc_orchestrator.core import config
 
 
+OFFLINE_TARGET = "./.offline-target/url-shortener-service"
+
+
 def apply_offline() -> None:
     os.environ["STUB_MODE"] = "true"
     os.environ["CHECKPOINTER"] = "sqlite"
     os.environ["EVENT_SINK"] = "jsonl"
     os.environ.setdefault("RETRY_BACKOFF_BASE_SECONDS", "0")
-    os.environ.setdefault("TARGET_REPO_PATH", "./.offline-target/url-shortener-service")
+    # FORCE the sandbox target: `.env` normally sets TARGET_REPO_PATH to the real generated project, and a
+    # setdefault here silently kept it, so `reset-target --offline` deleted the real project.
+    os.environ["TARGET_REPO_PATH"] = os.environ.get("OFFLINE_TARGET_REPO_PATH", OFFLINE_TARGET)
 
 
 def _graph_config(run_id: str, scenario: str = "") -> dict:
@@ -260,6 +265,9 @@ def cmd_reset_target(args) -> int:
     if args.offline:
         apply_offline()
     target = config.target_repo()
+    if args.offline and ".offline-target" not in target.parts:   # defence in depth: offline mode may only ever delete its sandbox
+        rprint(f"Refusing: --offline resets only a '.offline-target' sandbox, but the target is {target}")
+        return 2
     if not target.exists():
         rprint(f"{target} does not exist - nothing to do.")
         return 0
@@ -303,8 +311,12 @@ def cmd_doctor(args) -> int:
         check(f"checkpointer={kind}", True)
 
     if not stub:
-        have, want = runners.java_major(), int(config.java_version())
-        check(f"JDK >= {want}", bool(have and have >= want), f"found {have}" + ("" if have and have >= want else f" - install JDK {want} or set JAVA_VERSION={have}"))
+        have, want = runners.effective_java_major(), int(config.java_version())
+        note = ""
+        if os.environ.get("JAVA_HOME") and runners.java_home_major() not in (None, have):
+            note = f" (JAVA_HOME is JDK {runners.java_home_major()}, too old: ignored for Maven, PATH JDK used)"
+        check(f"JDK >= {want} for Maven", bool(have and have >= want),
+              f"found {have}{note}" + ("" if have and have >= want else f" - install JDK {want} or set JAVA_VERSION={have}"))
         check("Docker daemon (Testcontainers)", runners.docker_ok())
         try:
             meta = scaffold.fetch_metadata()

@@ -32,6 +32,39 @@ def java_major() -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _java_major_of(java_bin: str) -> int | None:
+    try:
+        proc = subprocess.run([java_bin, "-version"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r'version "(\d+)', proc.stderr + proc.stdout)
+    return int(m.group(1)) if m else None
+
+
+def java_home_major() -> int | None:
+    """Major version of the JDK in JAVA_HOME (None if unset/broken). The Maven wrapper prefers JAVA_HOME over PATH."""
+    home = os.environ.get("JAVA_HOME")
+    return _java_major_of(str(Path(home) / "bin" / "java")) if home else None
+
+
+def maven_env() -> dict:
+    """Environment for ./mvnw. A stale JAVA_HOME (e.g. still pointing at JDK 17 while JDK 21 is on PATH) makes
+    the wrapper ignore the right JDK and fail with 'release version 21 not supported'. If JAVA_HOME is too old
+    but the JDK on PATH is new enough, drop JAVA_HOME for the Maven child process so the PATH JDK is used."""
+    env = dict(os.environ)
+    want = int(config.java_version())
+    home_major = java_home_major()
+    if home_major is not None and home_major < want and (java_major() or 0) >= want:
+        env.pop("JAVA_HOME", None)
+    return env
+
+
+def effective_java_major() -> int | None:
+    """The JDK major version Maven will actually use (see maven_env)."""
+    env = maven_env()
+    return java_home_major() if env.get("JAVA_HOME") else java_major()
+
+
 def docker_ok() -> bool:
     if not shutil.which("docker"):
         return False
@@ -44,11 +77,12 @@ def preflight() -> list[str]:
         return []
     problems = []
     want = int(config.java_version())
-    have = java_major()
+    have = effective_java_major()
     if have is None:
         problems.append("java not found on PATH (need a JDK; set JAVA_HOME)")
     elif have < want:
-        problems.append(f"JDK {have} found but the project targets Java {want}: install JDK {want} or set JAVA_VERSION={have} in .env before the scaffold step")
+        problems.append(f"JDK {have} is what Maven would use but the project targets Java {want}: install JDK {want} "
+                        f"(and point JAVA_HOME at it or unset JAVA_HOME), or set JAVA_VERSION={have} in .env before the scaffold step")
     if not docker_ok():
         problems.append("Docker daemon not reachable (integration tests use Testcontainers)")
     return problems
@@ -102,7 +136,7 @@ def run_maven_tests(repo: Path) -> dict:
     cmd = ["./mvnw", "-B", "test"] if (repo / "mvnw").exists() else ["mvn", "-B", "test"]
     started = time.monotonic()
     try:
-        proc = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=config.maven_timeout_seconds())
+        proc = subprocess.run(cmd, cwd=repo, env=maven_env(), capture_output=True, text=True, timeout=config.maven_timeout_seconds())
         out = (proc.stdout + "\n" + proc.stderr)
         rc = proc.returncode
     except FileNotFoundError:

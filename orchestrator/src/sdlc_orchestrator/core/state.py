@@ -142,6 +142,8 @@ class OrchestratorState(TypedDict, total=False):
     ambiguities: Annotated[list[str], replace]
     assumptions: Annotated[list[str], replace]
     ambiguities_resolved: bool
+    clarification_answers: Annotated[list[str], replace]   # human answers so far, in order
+    clarification_decision: Annotated[str, replace]        # "" | answered | accept | decline
 
     # --- Workspace (git-backed target repo) ---
     workspace: Annotated[dict, merge_dict]  # repo_path, branch, base_sha, rollback_sha, ...

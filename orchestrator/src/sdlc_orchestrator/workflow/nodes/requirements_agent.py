@@ -62,36 +62,52 @@ Be strict: an ambiguity is not a nice-to-have question, it is something you cann
 design without. Vague quality words with no target ("reliable", "faster", "scalable") are ambiguities."""
 
 
-def vagueness_ambiguities(raw: str) -> list[str]:
-    words = raw.split()
-    if len(words) > 14 or MEASURABLE.search(raw):
+def vagueness_ambiguities(raw: str, answers: list[str] | None = None) -> list[str]:
+    """Length is judged on the ORIGINAL request only, so clarification answers
+    cannot silence the check by adding words; a measurable target in any answer resolves it."""
+    if len(raw.split()) > 14:
         return []
-    hits = sorted({m.group(0).lower() for m in VAGUE_TERMS.finditer(raw)})
+    text = " ".join([raw, *(answers or [])])
+    if MEASURABLE.search(text):
+        return []
+    hits = sorted({m.group(0).lower() for m in VAGUE_TERMS.finditer(text)})
     return [
         f"'{h}' is not measurable: what concrete target (SLO/latency/availability/failure mode) defines success?"
         for h in hits
     ]
 
 
+def effective_requirement(state: dict) -> str:
+    """The raw request plus every human clarification so far (empty on round 0)."""
+    answers = state.get("clarification_answers") or []
+    if not answers:
+        return state["raw_requirement"]
+    lines = "\n".join(f"- {a}" for a in answers)
+    return f"{state['raw_requirement']}\n\nHUMAN CLARIFICATIONS SO FAR (authoritative):\n{lines}"
+
+
 def requirements_node_impl(state: dict) -> dict:
     run_id = state["run_id"]
+    request = effective_requirement(state)
     scenario = state["scenario"]
     context = {
         "greenfield": "The service does not exist yet; it will be built from scratch.",
         "brownfield": "The service already exists; this is an enhancement to it.",
         "ambiguous": "The request may be underspecified; be strict about what is unclear.",
     }[scenario]
-    spec = invoke_json("requirements", SYSTEM_PROMPT, f"CONTEXT: {context}\n\nREQUEST:\n{state['raw_requirement']}", run_id=run_id)
+    spec = invoke_json("requirements", SYSTEM_PROMPT, f"CONTEXT: {context}\n\nREQUEST:\n{request}", run_id=run_id)
 
     spec.setdefault("problem_statement", state["raw_requirement"])
     for key in ("in_scope", "out_of_scope", "acceptance_criteria", "non_functional_requirements", "assumptions"):
         spec[key] = to_bool_list(spec.get(key))
     ambiguities = to_bool_list(spec.get("ambiguities"))
-    for extra in vagueness_ambiguities(state["raw_requirement"]):
+    for extra in vagueness_ambiguities(state["raw_requirement"], state.get("clarification_answers")):
         if extra not in ambiguities:
             ambiguities.append(extra)
     spec["ambiguities"] = ambiguities
     spec["baseline_nfrs"] = BASELINE_NFRS
+    if state.get("clarification_answers"):
+        spec["clarification_answers"] = list(state["clarification_answers"])
     assumptions = spec["assumptions"]
 
     if assumptions:

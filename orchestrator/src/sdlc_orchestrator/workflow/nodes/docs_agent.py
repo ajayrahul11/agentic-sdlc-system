@@ -12,6 +12,7 @@ from pathlib import Path
 
 from sdlc_orchestrator.core import config
 from sdlc_orchestrator.integrations import gitops
+from sdlc_orchestrator.integrations.design_html import render_design_html
 from sdlc_orchestrator.policy.java_scan import contract_endpoints
 from sdlc_orchestrator.workflow.nodes.common import repo_path, set_task_status
 from sdlc_orchestrator.integrations.repo_io import write_files
@@ -54,7 +55,8 @@ Java {config.java_version()} · Spring Boot 4 · PostgreSQL (Flyway) · Redis ·
 |---|---|
 {rows}
 
-Full contract: [`docs/openapi.yaml`](docs/openapi.yaml). Mutating endpoints require the `X-API-Key` header.
+Full contract: [`docs/openapi.yaml`](docs/openapi.yaml). Once running, the live OpenAPI spec is at
+`http://localhost:8080/v3/api-docs` and the Swagger UI at `http://localhost:8080/swagger-ui/index.html`. Mutating endpoints require the `X-API-Key` header.
 
 ## Run
 ```bash
@@ -80,7 +82,7 @@ curl -X POST localhost:8080/api/shorten -H "X-API-Key: $SHORTENER_API_KEY" -H 'C
 ## Architecture decisions
 {adrs}
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design document and `docs/adr/` for the decision records.
+See [`docs/DESIGN.md`](docs/DESIGN.md) (colourful HTML version: [`docs/DESIGN.html`](docs/DESIGN.html), with sequence diagrams, risks and trade-offs) for the full design document and `docs/adr/` for the decision records.
 """
 
 
@@ -94,6 +96,7 @@ def _impl(state: dict) -> dict:
 
     if design.get("design_document"):
         files["docs/DESIGN.md"] = design["design_document"].rstrip("\n") + "\n"
+        files["docs/DESIGN.html"] = render_design_html(design["design_document"])
 
     n = _next_adr_number(repo)
     for adr in design.get("adrs", []):

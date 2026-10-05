@@ -36,9 +36,39 @@ def fallback_after_failures() -> int:
     return _int("FALLBACK_AFTER_FAILURES", 2)
 
 
+def escalate_after_failures() -> int:
+    """Codegen runs on the cheaper model first; after this many failed attempts in the
+    current plan version it escalates to the stronger model (MODEL_CODEGEN_ESCALATED)."""
+    return _int("ESCALATE_AFTER_FAILURES", 1)
+
+
+def prompt_caching() -> bool:
+    """Anthropic prompt caching on the stable prompt prefix (system prompt + design)."""
+    return os.environ.get("PROMPT_CACHING", "true").lower() == "true"
+
+
 def max_replans() -> int:
     """Bounded upstream re-plans (Design re-run) per run."""
     return _int("MAX_REPLANS", 1)
+
+
+def max_clarification_rounds() -> int:
+    """Max times the human is asked to clarify requirements. After that the run
+    proceeds on logged assumptions (reviewed again at the design gate). Floor of
+    1: the cap bounds the loop, it cannot switch the gate off."""
+    return max(1, _int("MAX_CLARIFICATION_ROUNDS", 3))
+
+
+def max_design_revisions() -> int:
+    """Max 'revise' rounds at the design review gate. A design still not approved
+    after this many revisions aborts the run. Floor of 1."""
+    return max(1, _int("MAX_DESIGN_REVISIONS", 5))
+
+
+def max_run_cost_usd() -> float:
+    """Hard cap on cumulative LLM spend per run. Once reached, no further model call is made
+    and the run fails with BudgetExceededError (it can never loop its way past the cap)."""
+    return _float("MAX_RUN_COST_USD", 3.5)
 
 
 def backoff_base_seconds() -> float:
@@ -47,6 +77,12 @@ def backoff_base_seconds() -> float:
 
 def backoff_cap_seconds() -> float:
     return _float("RETRY_BACKOFF_CAP_SECONDS", 30.0)
+
+
+def llm_timeout_seconds() -> float:
+    """Per-request HTTP timeout. A hung request (no tokens flow) must fail fast instead of stalling a run for
+    20 minutes (600s x retry); a normal 16k-token design reply takes ~2 minutes."""
+    return _float("LLM_TIMEOUT_SECONDS", 240.0)
 
 
 def llm_max_attempts() -> int:
