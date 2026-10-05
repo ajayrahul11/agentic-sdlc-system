@@ -9,6 +9,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def offline_env(tmp_path, monkeypatch):
     monkeypatch.setenv("STUB_MODE", "true")
+    monkeypatch.setenv("SDLC_QUIET", "1")
     monkeypatch.setenv("CHECKPOINTER", "memory")
     monkeypatch.setenv("EVENT_SINK", "memory")
     monkeypatch.setenv("RETRY_BACKOFF_BASE_SECONDS", "0")
