@@ -76,7 +76,7 @@ Complete this section **before** the Quick start. The last column says where eac
 | **JDK 21** (JDK 17 also works) | the JDK must be **>= `JAVA_VERSION`** | `java -version` | **`JAVA_VERSION=21`** (set `17` if that is what you have) | `brew install --cask temurin@21` | `winget install EclipseAdoptium.Temurin.21.JDK` |
 | **Spring Boot 4** | Boot major version **>= 4** | nothing to install: the orchestrator downloads the project skeleton from start.spring.io and checks the version | `MIN_SPRING_BOOT_MAJOR=4`; `SPRING_BOOT_VERSION=` (empty = latest GA, or pin e.g. `4.1.1`) | n/a | n/a |
 | **Anthropic API key** | a key with API credit | n/a | **`ANTHROPIC_API_KEY=`** (or `MODEL_PROVIDER=openai` + `OPENAI_API_KEY=`) | n/a | n/a |
-| **Spend budget** | decide your cap | n/a | **`MAX_RUN_COST_USD=`** hard cap per run (default 3.5; a normal greenfield run costs roughly $0.5 to $1.5) | n/a | n/a |
+| **Spend budget** (optional) | decide your cap, or keep the default | n/a | **`MAX_RUN_COST_USD=`** optional hard cap per run in USD (default 3.5 when the line is absent; a normal greenfield run costs roughly $0.5 to $1.5) | n/a | n/a |
 | **Free ports** | **5433** (orchestrator DB), **8080** (generated service during deploy verification) | macOS: `lsof -i :8080` · Windows: `netstat -ano \| findstr :8080` | `ORCHESTRATOR_DB_URL` for 5433 | stop whatever holds the port | stop whatever holds the port |
 | **Internet access** | start.spring.io, Maven Central, Docker Hub, the LLM API | n/a | `INITIALIZR_URL` (optional) | n/a | n/a |
 
@@ -151,9 +151,14 @@ Edit `orchestrator/.env`. Only these need your attention; every other value has 
 |---|---|---|
 | `ANTHROPIC_API_KEY` | your key | required for real runs |
 | `JAVA_VERSION` | `21` (default) or `17` | must be <= the JDK `java -version` reports |
-| `MAX_RUN_COST_USD` | e.g. `2.0` | **hard spend cap per run** (default 3.5) |
+| `MAX_RUN_COST_USD` | **optional**, e.g. `2.0` | hard spend cap per run in USD; absent = default 3.5 (see the cost-safety note below) |
 | `LANGCHAIN_API_KEY` + `LANGCHAIN_TRACING_V2=true` | optional | LangSmith traces; the audit log never depends on it |
 | `CHECKPOINTER` / `EVENT_SINK` | `sqlite` / `jsonl` | optional: skip Postgres entirely (state under `orchestrator/runs/`) |
+
+> **Cost safety (optional, recommended): `MAX_RUN_COST_USD`.** Every run has a hard spend cap in US dollars. You do not have to set it:
+> if the line is absent the built-in default of **3.5** applies. To choose your own ceiling, add `MAX_RUN_COST_USD=2.0` (or any value) to `orchestrator/.env`; it is
+> documented, commented out, in `.env.example`. Each model call is priced from its token usage; when the running total reaches the cap, **no further model call is made** and
+> the run stops with `LLM budget exhausted`, so a retry loop can never overspend. A normal greenfield run costs roughly $0.5 to $1.5, and `metrics <run_id>` reports `llm_cost_usd`.
 
 **Already have an older `.env`?** New settings are added to `.env.example` over time (for example `MAX_RUN_COST_USD`, `LLM_TIMEOUT_SECONDS`, `DEPLOY_VERIFY`). Missing keys fall back to safe defaults, but list what you are missing and copy the lines you want:
 
