@@ -40,3 +40,8 @@ def test_ignores_tests_and_non_controllers():
 def test_contract_endpoints():
     spec = {"paths": {"/api/shorten": {"post": {}, "parameters": []}, "/{shortCode}": {"get": {}}}}
     assert contract_endpoints(spec) == {("POST", "/api/shorten"), ("GET", "/{}")}
+
+
+def test_normalize_path_handles_regex_constraint_with_braces():
+    assert normalize_path("/{code:[A-Za-z0-9_-]{3,32}}") == "/{}"
+    assert normalize_path("/api/{a}/x/{b:\\d{2}}") == "/api/{}/x/{}"

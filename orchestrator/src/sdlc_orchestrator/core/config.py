@@ -39,7 +39,7 @@ def fallback_after_failures() -> int:
 def escalate_after_failures() -> int:
     """Codegen runs on the cheaper model first; after this many failed attempts in the
     current plan version it escalates to the stronger model (MODEL_CODEGEN_ESCALATED)."""
-    return _int("ESCALATE_AFTER_FAILURES", 1)
+    return _int("ESCALATE_AFTER_FAILURES", 2)
 
 
 def prompt_caching() -> bool:

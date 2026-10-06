@@ -18,8 +18,26 @@ _STR_RE = re.compile(r'"([^"]*)"')
 _CLASS_RE = re.compile(r"\b(?:class|interface|record)\s+\w+")
 
 
+def _collapse_placeholders(path: str) -> str:
+    """{shortCode} / {code:[a-z]+} / {code:[A-Za-z0-9_-]{3,32}} -> {}. Braces are balanced by depth,
+    because a regex constraint may itself contain braces (a quantifier)."""
+    out, depth = [], 0
+    for ch in path:
+        if ch == "{":
+            if depth == 0:
+                out.append("{")
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                out.append("}")
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
 def normalize_path(path: str) -> str:
-    path = re.sub(r"\{[^}/]*\}", "{}", path)          # {shortCode} / {code:[a-z]+} -> {}
+    path = _collapse_placeholders(path)
     path = re.sub(r"/{2,}", "/", "/" + path.strip("/"))
     return path if path == "/" else path.rstrip("/")
 
