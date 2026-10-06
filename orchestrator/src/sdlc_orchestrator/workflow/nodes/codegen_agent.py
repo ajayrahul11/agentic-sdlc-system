@@ -128,19 +128,8 @@ analytics; 401 without key; 400 on invalid URL; 404 unknown code; 410 expired li
   * ContractTest.java: loads docs/openapi.yaml with org.yaml.snakeyaml.Yaml (from the working directory), and for every \
 path+method issues a request through the running app; fails with the message "not served by the application" if the \
 response is 404/405 for a declared operation
-Output budget: the whole reply is capped, so keep it compact. Write files in this ORDER so that anything cut off is the least \
-important: main code first, then ContractTest.java, then the integration test, then unit tests. Keep test classes small \
-(about 8 focused tests each, no long helper hierarchies).
 DO NOT write: entities, repositories, application.yml, Dockerfile, docker-compose.yml, migrations.""",
 }
-
-
-def not_owned(branch: str, path: str) -> bool:
-    """True when `path` belongs to the OTHER codegen branch (or to the orchestrator)."""
-    if branch == "impl_data":
-        return (path in ("Dockerfile", ".dockerignore", deploy.OPENAPI_CONFIG_PATH) or path.startswith("src/test/")
-                or "/web/" in path or path.endswith("/openapi.yaml") or "/db/migration/" in path)
-    return path in ("pom.xml", "Dockerfile", "docker-compose.yml") or path.startswith("src/main/resources/")
 
 
 def _select_components(design: dict, branch: str) -> list[dict]:
@@ -171,14 +160,13 @@ def _prior_files(state: dict, branch: str, budget: int = 90_000, only: list[str]
     return "\n\n".join(out)
 
 
-def failing_paths(feedback: str, owned: list[str], branch: str | None = None) -> list[str]:
+def failing_paths(feedback: str, owned: list[str]) -> list[str]:
     """Owned files the failure output points at: named by path or basename, or reported as
     an incomplete (truncated) file. Empty when the failure is not attributable to a file."""
     hits = [p for p in owned if p in feedback or p.rsplit("/", 1)[-1] in feedback]
     m = re.search(r"incomplete file\(s\): ([^;\n]+)", feedback)
     if m:
-        hits += [x.strip() for x in m.group(1).split(",")
-                 if x.strip() and x.strip() not in hits and not (branch and not_owned(branch, x.strip()))]
+        hits += [x.strip() for x in m.group(1).split(",") if x.strip() and x.strip() not in hits]
     return hits
 
 
@@ -218,18 +206,17 @@ def build_prompt_parts(state: dict, branch: str, repo) -> tuple[str, str, str]:
         owner = state.get("artifact_owner", {})
         owned = [p for p, c in (state.get("code_artifacts") or {}).items()
                  if owner.get(p) == branch and c and not p.endswith((".sql", "openapi.yaml"))]
-        targets = failing_paths(feedback, owned, branch)
+        targets = failing_paths(feedback, owned)
         prior = _prior_files(state, branch, only=targets or None)
         if targets:
             rest = [p for p in owned if p not in targets]
             parts.append("PREVIOUS ATTEMPT FAILED. Regenerate ONLY the files listed under FILES TO FIX (complete content each); "
                          "every other file is already correct on disk and MUST NOT be output again. Files that were cut off "
-                         "or never written must be written in full, and so must any other file your branch is REQUIRED to "
-                         "produce that is not among the existing files listed below (e.g. a missing ContractTest.java).\n"
+                         "or never written must be written in full.\n"
                          f"FILES TO FIX: {', '.join(targets)}\nFAILURE OUTPUT:\n{feedback}")
             parts.append("YOUR FILES FROM THE PREVIOUS ATTEMPT (only those to fix):\n" + prior)
             if rest:
-                parts.append("EXISTING UNCHANGED FILES (do not output; their API is in the design's component_plan):\n" + "\n".join(rest))
+                parts.append("UNCHANGED FILES (do not output; their API is in the design's component_plan):\n" + "\n".join(rest))
         elif prior:
             parts.append("PREVIOUS ATTEMPT FAILED. Fix the cause. Output ONLY files that need to change (complete content each).\n"
                          f"FAILURE OUTPUT:\n{feedback}")
@@ -243,22 +230,6 @@ def build_prompt_parts(state: dict, branch: str, repo) -> tuple[str, str, str]:
 def build_prompts(state: dict, branch: str, repo) -> tuple[str, str]:
     system, prefix, suffix = build_prompt_parts(state, branch, repo)
     return system, f"{prefix}\n\n{suffix}"
-
-
-def _failure_is_other_branchs(state: dict, branch: str) -> bool:
-    """On a retry, True when the failure output points only at files the OTHER branch owns, so this
-    branch's (already good) output is kept and no model call is made for it."""
-    feedback = state.get("failure_feedback") or ""
-    if not feedback or not state.get("code_artifacts"):
-        return False
-    owner = state.get("artifact_owner") or {}
-    mine = [p for p, b in owner.items() if b == branch and (state.get("code_artifacts") or {}).get(p)]
-    theirs = [p for p, b in owner.items() if b not in (branch, "deleted")]
-    m = re.search(r"incomplete file\(s\): ([^;\n]+)", feedback)
-    incomplete = [x.strip() for x in m.group(1).split(",")] if m else []
-    if any(not not_owned(branch, p) for p in incomplete):
-        return False
-    return bool(incomplete or failing_paths(feedback, theirs)) and not failing_paths(feedback, mine, branch)
 
 
 def failed_attempts(state: dict) -> int:
@@ -286,11 +257,7 @@ def _run_branch(state: dict, branch: str) -> dict:
 
     components = _select_components(design, branch)
     generated: dict[str, str] = {}
-    skip = _failure_is_other_branchs(state, branch)
-    if skip:
-        log_event(run_id, branch, "retry_skipped", {}, actor=f"agent:codegen:{branch}", outcome="ok",
-                  reason="the failure is in the other branch's files; nothing to regenerate here")
-    if not skip and (components or state.get("failure_feedback")):
+    if components or state.get("failure_feedback"):
         system, prefix, suffix = build_prompt_parts(state, branch, repo)
         model, escalated = _model_for_attempt(state)
         if escalated and model != model_for("codegen"):
@@ -303,7 +270,10 @@ def _run_branch(state: dict, branch: str) -> dict:
 
         # ownership discipline: the data branch must not emit tests/controllers etc. and vice versa
         for path in list(generated):
-            if not_owned(branch, path):
+            if branch == "impl_data" and (path in ("Dockerfile", ".dockerignore", deploy.OPENAPI_CONFIG_PATH) or path.startswith("src/test/") or "/web/" in path or path.endswith("/openapi.yaml") or "/db/migration/" in path):
+                errors.append(f"{branch} emitted a file it does not own: {path}")
+                generated.pop(path)
+            if branch == "impl_api" and (path in ("pom.xml", "Dockerfile", "docker-compose.yml") or path.startswith("src/main/resources/")):
                 errors.append(f"{branch} emitted a file it does not own: {path}")
                 generated.pop(path)
         artifacts.update(generated)
