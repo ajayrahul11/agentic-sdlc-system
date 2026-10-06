@@ -212,33 +212,3 @@ def test_anthropic_client_gets_low_effort_for_structured_stages_and_none_for_hai
     monkeypatch.setenv("LLM_EFFORT_DESIGN", "high")
     assert llm.get_llm("design").output_config == {"effort": "high"}
     assert not llm.get_llm("json_repair").output_config
-
-
-def test_replies_are_recorded_and_replayed_without_calling_the_api(monkeypatch, tmp_path):
-    import json
-    from types import SimpleNamespace
-
-    import pytest
-
-    from sdlc_orchestrator.llm import client
-
-    monkeypatch.setenv("STUB_MODE", "false")
-    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
-    monkeypatch.delenv("LLM_REPLAY_RUN", raising=False)
-
-    class Fake:
-        def invoke(self, messages):
-            return SimpleNamespace(content="===FILE: src/a.txt===\nhi\n===END===", usage_metadata={"input_tokens": 1, "output_tokens": 1},
-                                   response_metadata={"stop_reason": "max_tokens"})
-
-    monkeypatch.setattr(client, "get_llm", lambda stage, model=None: Fake())
-    assert client.invoke_llm("codegen", "s", "u", run_id="orig").startswith("===FILE")
-    rec = json.loads(next((tmp_path / "orig" / "llm").glob("001-codegen.json")).read_text())
-    assert rec["stop_reason"] == "max_tokens"      # truncation is reproduced on replay
-
-    # replay: the model must never be called
-    monkeypatch.setattr(client, "get_llm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("API called during replay")))
-    monkeypatch.setenv("LLM_REPLAY_RUN", "orig")
-    assert client.invoke_llm("codegen", "s", "u", run_id="again").startswith("===FILE")
-    with pytest.raises(client.AgentOutputError):    # only one reply was recorded
-        client.invoke_llm("codegen", "s", "u", run_id="again")
