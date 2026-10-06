@@ -94,3 +94,21 @@ def test_failing_paths_targets_only_named_files():
     assert failing_paths("[ERROR] /x/Foo.java:[3,1] cannot find symbol", owned) == ["src/main/java/a/Foo.java"]
     assert failing_paths("contract: GET /x not implemented", owned) == []
     assert failing_paths("truncated; incomplete file(s): src/main/java/a/New.java", owned) == ["src/main/java/a/New.java"]
+
+
+def test_incomplete_test_file_is_not_a_target_for_the_data_branch():
+    from sdlc_orchestrator.workflow.nodes.codegen_agent import failing_paths
+
+    fb = "truncated; incomplete file(s): src/test/java/com/rahul/urlshortener/IntegrationTestSupport.java"
+    assert failing_paths(fb, [], "impl_data") == []
+    assert failing_paths(fb, [], "impl_api") == ["src/test/java/com/rahul/urlshortener/IntegrationTestSupport.java"]
+
+
+def test_retry_skips_the_branch_that_did_not_fail():
+    from sdlc_orchestrator.workflow.nodes.codegen_agent import _failure_is_other_branchs
+
+    state = {"failure_feedback": "truncated; incomplete file(s): src/test/java/x/T.java",
+             "code_artifacts": {"src/main/java/x/E.java": "c", "src/main/java/x/C.java": "c"},
+             "artifact_owner": {"src/main/java/x/E.java": "impl_data", "src/main/java/x/C.java": "impl_api"}}
+    assert _failure_is_other_branchs(state, "impl_data") is True
+    assert _failure_is_other_branchs(state, "impl_api") is False
