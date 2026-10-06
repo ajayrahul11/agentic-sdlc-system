@@ -138,6 +138,18 @@ def _result(steps: list[dict], passed: bool, evidence: str = "", failure_class: 
             "output_tail": evidence[-6000:] if evidence else "", "ports": {"app": PORT}}
 
 
+def _missing_paths(contract_paths: list[str], spec_body: str) -> list[str]:
+    """Contract paths absent from the live /v3/api-docs. `contract_paths` are normalised
+    ({shortCode} -> {}), so compare against the live spec's paths normalised the same way."""
+    from sdlc_orchestrator.policy.java_scan import normalize_path
+
+    try:
+        live = {normalize_path(p) for p in (json.loads(spec_body).get("paths") or {})}
+    except (ValueError, AttributeError):
+        return [p for p in contract_paths if p not in spec_body]
+    return [p for p in contract_paths if normalize_path(p) not in live]
+
+
 def _smoke(steps: list[dict], contract_paths: list[str], key: str) -> str | None:
     """Run the API smoke test. Returns an error string for the first failing check, else None."""
     def check(name: str, ok: bool, detail: str = "") -> str | None:
@@ -174,7 +186,7 @@ def _smoke(steps: list[dict], contract_paths: list[str], key: str) -> str | None
     if err := check("GET /api/analytics/{shortCode} counts the click", clicks >= 1, f"status {st}, totalClicks={clicks}: {body[:200]}"):
         return err
     st, _, body = _http("GET", "/v3/api-docs")
-    missing = [p for p in contract_paths if p not in body]
+    missing = _missing_paths(contract_paths, body)
     if err := check("GET /v3/api-docs serves the OpenAPI spec", st == 200 and not missing, f"got {st}, missing paths {missing}"):
         return err
     if err := check("OpenAPI spec declares the X-API-Key scheme (Swagger UI 'Authorize' button)",

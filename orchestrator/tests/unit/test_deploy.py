@@ -122,3 +122,11 @@ def test_generated_readme_has_prerequisites_and_a_mac_and_windows_quick_start():
                    "export SHORTENER_API_KEY", "swagger-ui/index.html", "Authorize", "mvnw.cmd", "docker compose down", "## Troubleshooting"):
         assert needed in readme, needed
     assert readme.index("## Prerequisites") < readme.index("## Quick start")
+
+
+def test_missing_paths_compares_normalised_paths():
+    from sdlc_orchestrator.integrations.deploy import _missing_paths
+
+    spec = '{"paths": {"/api/shorten": {}, "/{shortCode}": {}, "/api/analytics/{code}": {}}}'
+    assert _missing_paths(["/api/shorten", "/{}", "/api/analytics/{}"], spec) == []
+    assert _missing_paths(["/api/shorten", "/api/other"], spec) == ["/api/other"]
