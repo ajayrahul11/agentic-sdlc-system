@@ -165,12 +165,21 @@ pip install -e ".[dev]"
 pytest                                                    # full offline suite, ~15 s
 python -m sdlc_orchestrator doctor --offline              # all rows yes
 python -m sdlc_orchestrator run --offline --scenario greenfield --requirement "Build a URL shortener with shorten, redirect, and click analytics" --non-interactive
-# it pauses at the DESIGN gate. Use the run id it printed:
+```
+The run then pauses at the DESIGN gate and prints its `<run_id>`. Run the next commands **one at a time**, each only when the console tells you the run is paused:
+```bash
+# only after the console shows "PAUSED at human gate 'design'" (<run_id> is printed on the "Starting run" line):
 python -m sdlc_orchestrator resume <run_id> --offline --design-decision approve --approver you
-# ...then pauses at the RELEASE gate:
+# only after the console shows "PAUSED at human gate 'release'":
 python -m sdlc_orchestrator resume <run_id> --offline --decision approve --approver you --rationale "smoke"
+# when finished:
 python -m sdlc_orchestrator reset-target --offline        # type the folder name it shows; offline mode can only ever touch its own sandbox
 ```
+
+> **Run the approval commands one at a time, and only when the console asks for them.** The run pauses at each gate and prints
+> `Run PAUSED at human gate '<gate>' - waiting for your approval` followed by a ready-made `Resume with: ...` command.
+> Do **not** paste several `resume` commands together: the release gate does not exist until the design gate is approved and the build finishes (this can take several minutes).
+> `<run_id>` is not something you choose: the console prints it on the `Starting run <run_id> (...)` line, and you copy it into the command.
 
 `--offline` uses a stub LLM and a sandbox target (`orchestrator/.offline-target/`). It never touches your real `url-shortener-service`.
 
@@ -230,6 +239,10 @@ Commands are single lines so they work in bash and PowerShell.
 ```bash
 python -m sdlc_orchestrator run --scenario greenfield --requirement "Build a URL shortener with shorten, redirect, and click analytics" --non-interactive
 ```
+> **Approve one gate at a time.** Run the command in step 2 only after the console prints `Run PAUSED at human gate 'design'`, and the command in
+> step 3 only after it prints `Run PAUSED at human gate 'release'` (several minutes later). Don't paste both together. The console prints the exact
+> `Resume with: ...` line for you; `<run_id>` is printed on the `Starting run <run_id> (greenfield)` line and you copy it into the command.
+
 1. The run decomposes the work and designs the service, then **pauses at the design gate** (human gate 2). No code exists yet. Read
    `orchestrator/runs/<run_id>/DESIGN.html` in a browser (colourful; includes sequence diagrams, risks and trade-offs).
 2. Answer the gate:
@@ -247,7 +260,12 @@ python -m sdlc_orchestrator run --scenario greenfield --requirement "Build a URL
 
 ```bash
 python -m sdlc_orchestrator run --scenario brownfield --requirement "Add custom alias support and geo-breakdown analytics" --non-interactive
+```
+Then approve the gates **one at a time**, each only after the console prints `Run PAUSED at human gate '<gate>'` (`<run_id>` is on the `Starting run` line):
+```bash
+# after "PAUSED at human gate 'design'":
 python -m sdlc_orchestrator resume <run_id> --design-decision approve --approver you
+# after "PAUSED at human gate 'release'" (several minutes later):
 python -m sdlc_orchestrator resume <run_id> --decision approve --approver you --rationale "extension verified"
 ```
 Refuses to run if the greenfield output does not exist. It first does **codebase reasoning over the real repo** (impacted files are verified on disk), the design document marks what changed,
