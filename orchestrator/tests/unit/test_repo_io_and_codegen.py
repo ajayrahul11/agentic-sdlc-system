@@ -76,3 +76,21 @@ def test_delete_directives_are_parsed_and_migrations_protected():
     from sdlc_orchestrator.integrations.repo_io import parse_deletes
     paths, problems = parse_deletes("===DELETE: src/main/java/A.java===\n===DELETE: src/main/resources/db/migration/V1__x.sql===\n===DELETE: ../x===")
     assert paths == ["src/main/java/A.java"] and len(problems) == 2
+
+
+def test_truncated_output_names_the_incomplete_file():
+    from sdlc_orchestrator.integrations.repo_io import parse_file_blocks
+
+    text = "===FILE: src/main/java/A.java===\nclass A {}\n===END===\n===FILE: src/main/java/B.java===\nclass B {"
+    files, problems = parse_file_blocks(text)
+    assert list(files) == ["src/main/java/A.java"]
+    assert "incomplete file(s): src/main/java/B.java" in problems[0]
+
+
+def test_failing_paths_targets_only_named_files():
+    from sdlc_orchestrator.workflow.nodes.codegen_agent import failing_paths
+
+    owned = ["src/main/java/a/Foo.java", "src/main/java/a/Bar.java"]
+    assert failing_paths("[ERROR] /x/Foo.java:[3,1] cannot find symbol", owned) == ["src/main/java/a/Foo.java"]
+    assert failing_paths("contract: GET /x not implemented", owned) == []
+    assert failing_paths("truncated; incomplete file(s): src/main/java/a/New.java", owned) == ["src/main/java/a/New.java"]

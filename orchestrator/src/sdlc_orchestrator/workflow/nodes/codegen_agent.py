@@ -26,6 +26,8 @@ Java files are miserable to keep valid inside JSON strings.
 from __future__ import annotations
 
 import json
+import re
+
 import yaml
 
 from sdlc_orchestrator.core import config
@@ -146,16 +148,26 @@ def _write_deterministic(repo, design: dict) -> dict[str, str]:
     return files
 
 
-def _prior_files(state: dict, branch: str, budget: int = 90_000) -> str:
+def _prior_files(state: dict, branch: str, budget: int = 90_000, only: list[str] | None = None) -> str:
     owner = state.get("artifact_owner", {})
     out, used = [], 0
     for path, content in (state.get("code_artifacts") or {}).items():
-        if owner.get(path) == branch and not path.endswith((".sql", "openapi.yaml")):
+        if owner.get(path) == branch and not path.endswith((".sql", "openapi.yaml")) and (only is None or path in only):
             if used + len(content) > budget:
                 break
             out.append(f"### CURRENT {path}\n{content}")
             used += len(content)
     return "\n\n".join(out)
+
+
+def failing_paths(feedback: str, owned: list[str]) -> list[str]:
+    """Owned files the failure output points at: named by path or basename, or reported as
+    an incomplete (truncated) file. Empty when the failure is not attributable to a file."""
+    hits = [p for p in owned if p in feedback or p.rsplit("/", 1)[-1] in feedback]
+    m = re.search(r"incomplete file\(s\): ([^;\n]+)", feedback)
+    if m:
+        hits += [x.strip() for x in m.group(1).split(",") if x.strip() and x.strip() not in hits]
+    return hits
 
 
 def _existing_context(repo, state: dict, budget: int = 60_000) -> str:
@@ -191,8 +203,21 @@ def build_prompt_parts(state: dict, branch: str, repo) -> tuple[str, str, str]:
         parts.append("Preserve all existing behaviour and tests; only add/modify what the requirement needs.")
     feedback = state.get("failure_feedback")
     if feedback:
-        prior = _prior_files(state, branch)
-        if prior:
+        owner = state.get("artifact_owner", {})
+        owned = [p for p, c in (state.get("code_artifacts") or {}).items()
+                 if owner.get(p) == branch and c and not p.endswith((".sql", "openapi.yaml"))]
+        targets = failing_paths(feedback, owned)
+        prior = _prior_files(state, branch, only=targets or None)
+        if targets:
+            rest = [p for p in owned if p not in targets]
+            parts.append("PREVIOUS ATTEMPT FAILED. Regenerate ONLY the files listed under FILES TO FIX (complete content each); "
+                         "every other file is already correct on disk and MUST NOT be output again. Files that were cut off "
+                         "or never written must be written in full.\n"
+                         f"FILES TO FIX: {', '.join(targets)}\nFAILURE OUTPUT:\n{feedback}")
+            parts.append("YOUR FILES FROM THE PREVIOUS ATTEMPT (only those to fix):\n" + prior)
+            if rest:
+                parts.append("UNCHANGED FILES (do not output; their API is in the design's component_plan):\n" + "\n".join(rest))
+        elif prior:
             parts.append("PREVIOUS ATTEMPT FAILED. Fix the cause. Output ONLY files that need to change (complete content each).\n"
                          f"FAILURE OUTPUT:\n{feedback}")
             parts.append("YOUR FILES FROM THE PREVIOUS ATTEMPT:\n" + prior)

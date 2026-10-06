@@ -19,12 +19,21 @@ They are split into a decorated *request* node and an undecorated *gate*.
 from __future__ import annotations
 
 import functools
+import os
+import sys
 import time
 from typing import Callable
 
 from sdlc_orchestrator.workflow import contracts
 from sdlc_orchestrator.core.events import log_event
 from sdlc_orchestrator.core.state import now_iso
+
+
+def progress(msg: str) -> None:
+    """Live status line so the user knows an agent is working (stderr; silence with SDLC_QUIET=1)."""
+    if os.environ.get("SDLC_QUIET", "").lower() in ("1", "true", "yes"):
+        return
+    print(msg, file=sys.stderr, flush=True)
 
 
 class PreconditionError(RuntimeError):
@@ -50,11 +59,13 @@ def stage(name: str, actor: str | None = None) -> Callable:
 
             started = time.monotonic()
             log_event(run_id, name, "entry", {}, actor=who)
+            progress(f"\u23f3 [{name}] working... (this can take a while; I'll tell you when it finishes or needs your approval)")
             try:
                 delta = fn(state)
             except Exception as exc:
                 log_event(run_id, name, "node_error", {"error": type(exc).__name__}, actor=who,
                           outcome="error", reason=f"{type(exc).__name__}: {exc}"[:500])
+                progress(f"\u2717 [{name}] failed: {type(exc).__name__}: {exc}"[:300])
                 raise
 
             outcome = delta.pop("_outcome", "ok")
@@ -69,6 +80,7 @@ def stage(name: str, actor: str | None = None) -> Callable:
 
             duration_ms = int((time.monotonic() - started) * 1000)
             log_event(run_id, name, "exit", detail, actor=who, outcome=outcome, reason=reason, duration_ms=duration_ms)
+            progress(f"\u2713 [{name}] finished ({duration_ms / 1000:.1f}s, outcome: {outcome})")
             delta["timeline"] = [{"node": name, "event": "exit", "outcome": outcome, "at": now_iso(), "duration_ms": duration_ms}]
             delta["current_node"] = name
             return delta

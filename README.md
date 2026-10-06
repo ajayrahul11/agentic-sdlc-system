@@ -21,6 +21,41 @@ agentic-sdlc-system/
 already exists; brownfield refuses to run if it does *not*. That ordering is enforced by
 the workspace node's preconditions, not by convention.
 
+## Contents
+
+- [The lifecycle at a glance](#the-lifecycle-at-a-glance)
+- [Project layout](#project-layout)
+- [Prerequisites](#prerequisites)
+- [Quick start](#quick-start)
+  - [Step 1: install the orchestrator](#step-1-install-the-orchestrator)
+  - [Step 2: prove the wiring offline (no key, no Docker, no network, no cost)](#step-2-prove-the-wiring-offline-no-key-no-docker-no-network-no-cost)
+  - [Step 3: configure a real run](#step-3-configure-a-real-run)
+  - [Step 4: start the orchestrator's database and run the health check](#step-4-start-the-orchestrators-database-and-run-the-health-check)
+- [Running the three scenarios](#running-the-three-scenarios)
+  - [Scenario 1: Greenfield (build the service from nothing)](#scenario-1-greenfield-build-the-service-from-nothing)
+  - [Scenario 2: Brownfield (safely extend the existing service)](#scenario-2-brownfield-safely-extend-the-existing-service)
+  - [Scenario 3: Ambiguous (the system stops instead of guessing)](#scenario-3-ambiguous-the-system-stops-instead-of-guessing)
+  - [Inspecting any run](#inspecting-any-run)
+- [Run the generated service yourself](#run-the-generated-service-yourself)
+- [If a run goes wrong: cleaning up and starting over](#if-a-run-goes-wrong-cleaning-up-and-starting-over)
+- [Troubleshooting](#troubleshooting)
+- [Architecture](#architecture)
+  - [1. System context: two systems, one boundary](#1-system-context-two-systems-one-boundary)
+  - [2. The agent graph](#2-the-agent-graph)
+  - [3. A run over time: pause, resume, approve](#3-a-run-over-time-pause-resume-approve)
+  - [4. Failure handling: what happens when something goes wrong](#4-failure-handling-what-happens-when-something-goes-wrong)
+  - [5. Git model: how rollback works](#5-git-model-how-rollback-works)
+  - [6. Layers and responsibilities](#6-layers-and-responsibilities)
+  - [7. State and audit model](#7-state-and-audit-model)
+  - [8. Where the gates sit](#8-where-the-gates-sit)
+  - [9. Infrastructure view](#9-infrastructure-view)
+- [The agents (one module each, `orchestrator/src/sdlc_orchestrator/workflow/nodes/`)](#the-agents-one-module-each-orchestratorsrcsdlc_orchestratorworkflownodes)
+- [Product requirements → where they are implemented](#product-requirements--where-they-are-implemented)
+- [Non-functional requirements](#non-functional-requirements)
+- [Testing approach](#testing-approach)
+- [Trade-offs & decisions](#trade-offs--decisions)
+- [Known limitations](#known-limitations)
+
 ## The lifecycle at a glance
 
 Who acts at each step: 🤖 agent, ⚙️ deterministic system check, 🧑 **human gate** (the run pauses and waits).
@@ -503,7 +538,7 @@ The failure class decides the response, so a wrong *design* is fixed by re-runni
 | LLM API error / hung request | n/a | Per-request timeout (`LLM_TIMEOUT_SECONDS`), exponential backoff, then fail loudly | `LLM_MAX_ATTEMPTS` |
 | **Spend reaches `MAX_RUN_COST_USD`** | n/a | **No further model call is made**; the run fails with `BudgetExceededError` (never retried). Spend is computed from token usage per call and survives `resume` | hard cap |
 | Model returns invalid JSON | n/a | One repair attempt (only the bad reply goes to the cheap `json_repair` model), then fail loudly (never silently guessed) | 1 |
-| Codegen attempt failed | `compile`/`test`/`guardrail` | Next attempt escalates from the cheaper codegen model to the stronger one (see Model routing) | `ESCALATE_AFTER_FAILURES` (1) |
+| Codegen attempt failed | `compile`/`test`/`guardrail` | Next attempt escalates from the cheaper codegen model to the stronger one (see Model routing) | `ESCALATE_AFTER_FAILURES` (2) |
 
 ### 5. Git model: how rollback works
 
@@ -641,7 +676,7 @@ Token cost is controlled in `llm/client.py`; no stage uses one model by default.
   (`LLM_EFFORT_<STAGE>` overrides).
 * **Cost cap:** every call's cost is computed from token usage (input, output, cache read 0.1x, cache write 1.25x) and logged as `cost_usd`; the run stops at `MAX_RUN_COST_USD`.
 * **Override** any stage with `MODEL_<STAGE>`; set the escalation model with `MODEL_CODEGEN_ESCALATED`.
-* **Escalation:** once `ESCALATE_AFTER_FAILURES` (default 1) attempts have failed in the current plan version,
+* **Escalation:** once `ESCALATE_AFTER_FAILURES` (default 2) attempts have failed in the current plan version,
   codegen uses the escalated model and logs a `model_escalation` event. A re-plan starts a new plan version, so it starts cheap again.
   This is independent of the `simple` strategy fallback (`FALLBACK_AFTER_FAILURES`).
 * **Prompt caching (Anthropic):** the system prompt and codegen's stable prefix (design + the branch's components) carry

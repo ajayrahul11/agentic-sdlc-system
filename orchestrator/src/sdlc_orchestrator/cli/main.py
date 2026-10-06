@@ -71,7 +71,8 @@ def pending_interrupt(graph, cfg) -> dict | None:
 
 
 def prompt_for(payload: dict) -> dict:
-    rprint(f"\n[bold yellow]>>> HUMAN GATE: {payload.get('gate')}[/bold yellow]")
+    rprint(f"\n[bold yellow]>>> HUMAN GATE: {payload.get('gate')}[/bold yellow]  "
+           "[yellow]Agents are paused - your approval/input is needed to continue.[/yellow]")
     if payload.get("gate") == "design":
         rprint(payload.get("design_document", ""))
         rprint({k: v for k, v in payload.items() if k != "design_document"})
@@ -103,7 +104,7 @@ def drive(graph, cfg, first_input, interactive: bool) -> dict:
     graph.invoke(first_input, config=cfg)
     while (payload := pending_interrupt(graph, cfg)) is not None:
         if not interactive:
-            rprint(f"\n[bold yellow]Run PAUSED at human gate '{payload.get('gate')}'.[/bold yellow]")
+            rprint(f"\n[bold yellow]Run PAUSED at human gate '{payload.get('gate')}' - waiting for your approval.[/bold yellow]")
             rprint(payload)
             if payload.get("gate") == "design":
                 resume_hint = ("--design-decision approve|reject|revise --approver NAME "
@@ -115,7 +116,9 @@ def drive(graph, cfg, first_input, interactive: bool) -> dict:
             rprint(f"Resume with:  python -m sdlc_orchestrator resume {cfg['configurable']['thread_id']} "
                    + resume_hint)
             return graph.get_state(cfg).values
-        graph.invoke(Command(resume=prompt_for(payload)), config=cfg)
+        resume = prompt_for(payload)
+        rprint("[cyan]Decision recorded - agents resuming...[/cyan]")
+        graph.invoke(Command(resume=resume), config=cfg)
     return graph.get_state(cfg).values
 
 
@@ -195,6 +198,7 @@ def cmd_resume(args) -> int:
                 return 1
             value = {"decision": args.decision, "approver": args.approver, "rationale": args.rationale or ""}
         try:
+            rprint("[cyan]Decision recorded - agents resuming...[/cyan]")
             graph.invoke(Command(resume=value), config=cfg)
             values = graph.get_state(cfg).values
             nxt = pending_interrupt(graph, cfg)

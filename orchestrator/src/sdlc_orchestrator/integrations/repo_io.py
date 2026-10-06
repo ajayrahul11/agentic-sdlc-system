@@ -51,7 +51,10 @@ def parse_file_blocks(text: str) -> tuple[dict[str, str], list[str]]:
     headers = len(re.findall(r"===FILE:", text))
     ends = len(re.findall(r"===END===", text))
     if headers != ends:
-        problems.append(f"output truncated or malformed: {headers} FILE headers vs {ends} END markers")
+        done = set(files)
+        incomplete = [h.strip() for h in re.findall(r"===FILE:\s*(.+?)\s*===", text) if h.strip() not in done]
+        problems.append(f"output truncated or malformed: {headers} FILE headers vs {ends} END markers"
+                        + (f"; incomplete file(s): {', '.join(incomplete[:5])}" if incomplete else ""))
     return files, problems
 
 
