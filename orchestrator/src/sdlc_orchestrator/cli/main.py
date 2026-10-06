@@ -359,6 +359,9 @@ def cmd_doctor(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Agentic SDLC orchestrator for the URL shortener")
     common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--replay", metavar="RUN_ID",
+                        help="serve the saved model replies of an earlier run (runs/<RUN_ID>/llm/) instead of calling the API: $0. "
+                             "Pass the same flag to `resume`.")
     common.add_argument("--offline", action="store_true",
                         help="stub LLM + fake mvn + sqlite/jsonl stores (no keys, Docker or network)")
     sub = p.add_subparsers(dest="command", required=True)
@@ -392,6 +395,9 @@ def main(argv: list[str] | None = None) -> int:
     add("doctor", cmd_doctor)
 
     args = p.parse_args(argv)
+    if getattr(args, "replay", None):
+        os.environ["LLM_REPLAY_RUN"] = args.replay
+        rprint(f"[bold cyan]REPLAY MODE: model replies come from runs/{args.replay}/llm/ - no API calls, $0[/bold cyan]")
     return args.fn(args)
 
 

@@ -38,6 +38,7 @@ the workspace node's preconditions, not by convention.
   - [Inspecting any run](#inspecting-any-run)
 - [Run the generated service yourself](#run-the-generated-service-yourself)
 - [If a run goes wrong: cleaning up and starting over](#if-a-run-goes-wrong-cleaning-up-and-starting-over)
+  - [Re-running a failed run for $0 (replay)](#re-running-a-failed-run-for-0-replay)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
   - [1. System context: two systems, one boundary](#1-system-context-two-systems-one-boundary)
@@ -335,6 +336,17 @@ it prints the exact path and requires you to **type the folder name** to confirm
 
 Inside a run, the orchestrator only ever **resets files inside the repo** (git rollback to the last approved commit after exhausted retries, or removing a file the model created in this same run).
 Offline mode (`--offline`) is sandboxed to `orchestrator/.offline-target/` and refuses to reset anything else.
+
+### Re-running a failed run for $0 (replay)
+
+Every real model reply is saved to `orchestrator/runs/<run_id>/llm/` (one JSON file per call, including the stop reason, so truncation reproduces). After you fix a bug that sits **after** the model (parsing, quality gate, tests, deploy check), re-run the same generation without paying again:
+
+```bash
+python -m sdlc_orchestrator reset-target
+python -m sdlc_orchestrator run --replay <old_run_id> --scenario greenfield --requirement "<the same requirement>" --non-interactive
+python -m sdlc_orchestrator resume <new_run_id> --replay <old_run_id> --design-decision approve --approver you
+```
+Pass `--replay` to `resume` too. Replies are served per stage in the order they were recorded and `llm_call` events show `replayed: true` with cost 0. If the new code asks for more replies than were recorded (for example a retry the old run never made), the run stops with a clear "no more recorded replies" error instead of calling the API. Only runs made after this feature existed have recordings.
 
 ## Troubleshooting
 

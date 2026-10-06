@@ -19,11 +19,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 
 from sdlc_orchestrator.core import config
-from sdlc_orchestrator.core.events import events_for_run, log_event
+from sdlc_orchestrator.core.events import events_for_run, log_event, redact
 
 DEFAULT_MODELS = {
     "anthropic": {
@@ -48,11 +49,15 @@ ESCALATED_MODELS = {
 DEFAULT_EFFORT = {"default": "low", "codegen": "medium"}
 MAX_REPAIR_CHARS = 20000  # longer replies are re-requested in full, not repaired by a cheap model
 MAX_TOKENS = {"codegen": 32000, "design": 16000, "design_doc": 12000}
-NON_RETRYABLE = ("BudgetExceededError", "AuthenticationError", "PermissionDeniedError", "BadRequestError", "NotFoundError", "ValueError", "KeyError")
+NON_RETRYABLE = ("ReplayExhaustedError", "BudgetExceededError", "AuthenticationError", "PermissionDeniedError", "BadRequestError", "NotFoundError", "ValueError", "KeyError")
 
 
 class AgentOutputError(RuntimeError):
     """The model could not produce output satisfying the stage contract."""
+
+
+class ReplayExhaustedError(AgentOutputError):
+    """LLM_REPLAY_RUN is set but the recorded run has no (more) saved replies for this stage."""
 
 
 class BudgetExceededError(AgentOutputError):
@@ -176,6 +181,56 @@ def build_messages(system: str, user: str, cache_prefix: str = "") -> list[dict]
             {"role": "user", "content": blocks}]
 
 
+# ---------------------------------------------------------------------------
+# Record / replay: every real model reply is saved under runs/<run_id>/llm/ so a failed run can be
+# re-run through the rest of the pipeline for $0 (LLM_REPLAY_RUN=<old run id>). Replies are served per
+# stage in the order they were recorded; the model is never called while replaying.
+# ---------------------------------------------------------------------------
+_record_lock = threading.Lock()
+_replay_cursor: dict[tuple[str, str], int] = {}
+
+
+def _record_reply(run_id: str, stage: str, model: str, stop_reason: str | None, text: str) -> None:
+    """Best-effort: a recording problem must never fail a run."""
+    try:
+        d = config.runs_dir() / run_id / "llm"
+        with _record_lock:
+            d.mkdir(parents=True, exist_ok=True)
+            n = len(list(d.glob("*.json"))) + 1
+            (d / f"{n:03d}-{stage}.json").write_text(
+                json.dumps({"stage": stage, "model": model, "stop_reason": stop_reason, "text": redact(text)}, indent=1),
+                encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def replay_source() -> str | None:
+    return os.environ.get("LLM_REPLAY_RUN") or None
+
+
+def _replay_reply(source: str, stage: str, run_id: str | None, attempt: int, started: float) -> dict:
+    """Next recorded reply for `stage`. The cursor is the number of replayed calls this run already logged
+    for the stage, so it survives `resume` in a new process. The lock covers read + log so the two parallel
+    codegen branches never take the same reply."""
+    with _record_lock:
+        done = (sum(1 for e in events_for_run(run_id)
+                    if e["node"] == stage and e["event_type"] == "llm_call" and (e.get("detail") or {}).get("replayed"))
+                if run_id else _replay_cursor.get((source, stage), 0))
+        d = config.runs_dir() / source / "llm"
+        files = sorted(d.glob(f"*-{stage}.json")) if d.is_dir() else []
+        if done >= len(files):
+            raise ReplayExhaustedError(f"replay of run {source}: no (more) recorded replies for stage {stage!r} "
+                                       f"(recordings are in runs/{source}/llm/)")
+        rec = json.loads(files[done].read_text(encoding="utf-8"))
+        _replay_cursor[(source, stage)] = done + 1
+        if run_id:
+            log_event(run_id, stage, "llm_call",
+                      {"model": f"replay:{source}", "cost_usd": 0.0, "run_cost_usd": round(run_spend(run_id), 4),
+                       "stop_reason": rec.get("stop_reason"), "attempt": attempt, "replayed": True},
+                      actor=f"agent:{stage}", outcome="ok", duration_ms=int((time.monotonic() - started) * 1000))
+        return rec
+
+
 def invoke_llm(stage: str, system: str, user: str, *, run_id: str | None = None,
                cache_prefix: str = "", model: str | None = None) -> str:
     """One model call with exponential backoff. Returns response text.
@@ -195,6 +250,9 @@ def _invoke(stage: str, system: str, user: str, *, run_id: str | None, cache_pre
         started = time.monotonic()
         try:
             _check_budget(run_id, stage)
+            if (source := replay_source()) and not config.stub_mode():
+                rec = _replay_reply(source, stage, run_id, attempt, started)
+                return rec["text"], rec.get("stop_reason")
             llm = get_llm(stage, model)
             response = llm.invoke(build_messages(system, user, cache_prefix))
             usage = getattr(response, "usage_metadata", None) or {}
@@ -215,7 +273,10 @@ def _invoke(stage: str, system: str, user: str, *, run_id: str | None, cache_pre
                      "stop_reason": stop_reason, "attempt": attempt},
                     actor=f"agent:{stage}", outcome="ok", duration_ms=int((time.monotonic() - started) * 1000),
                 )
-            return content_text(response), stop_reason
+            text_out = content_text(response)
+            if run_id and not config.stub_mode():
+                _record_reply(run_id, stage, used_model, stop_reason, text_out)
+            return text_out, stop_reason
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             retryable = type(exc).__name__ not in NON_RETRYABLE
