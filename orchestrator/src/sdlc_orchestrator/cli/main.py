@@ -307,7 +307,7 @@ def cmd_doctor(args) -> int:
 
     stub = config.stub_mode()
     provider = os.environ.get("MODEL_PROVIDER", "anthropic")
-    key = "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY"
+    key = {"anthropic": "ANTHROPIC_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}.get(provider, "OPENAI_API_KEY")
     check(f"{key} set", bool(os.environ.get(key)) or stub, "(not needed in offline mode)" if stub else "")
     check("LangSmith key (optional)", True, "set" if os.environ.get("LANGCHAIN_API_KEY") else "not set - tracing disabled, audit log unaffected")
     check("git", bool(shutil.which("git")))

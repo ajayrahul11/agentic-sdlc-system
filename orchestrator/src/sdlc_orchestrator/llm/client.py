@@ -37,11 +37,15 @@ DEFAULT_MODELS = {
         "json_repair": "claude-haiku-4-5-20251001",         # reformats a bad reply, needs no reasoning
     },
     "openai": {"default": "gpt-4.1", "json_repair": "gpt-4.1-mini"},
+    "deepseek": {"default": "deepseek-v4-pro"},  # one DeepSeek model for every lifecycle stage; override per stage with MODEL_<STAGE>
 }
 ESCALATED_MODELS = {
     "anthropic": {"codegen": "claude-opus-5-5"},  # code quality is the retry-cost driver
     "openai": {},
+    "deepseek": {},
 }
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"  # OpenAI-compatible endpoint; override with DEEPSEEK_BASE_URL
+
 # Claude 5 models think adaptively and thinking tokens count against max_tokens: at the default effort a
 # design call spent ALL 16000 tokens on reasoning and returned an empty reply. Effort is the control; keep it
 # low where the output is a structured document, medium for code. Override: LLM_EFFORT_<STAGE>=low|medium|high.
@@ -60,7 +64,7 @@ class BudgetExceededError(AgentOutputError):
 
 
 # $ per million tokens (input, output). Cache reads cost 0.1x input, cache writes 1.25x input.
-PRICES = {"opus": (4.0, 20.0), "sonnet": (2.0, 10.0), "haiku": (1.0, 5.0)}
+PRICES = {"opus": (4.0, 20.0), "sonnet": (2.0, 10.0), "haiku": (1.0, 5.0), "deepseek": (0.66, 1.99)}
 _spend: dict[str, float] = {}
 
 
@@ -139,7 +143,13 @@ def get_llm(stage: str = "default", model: str | None = None):
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(model=model, max_tokens=max_tokens, timeout=config.llm_timeout_seconds(), max_retries=1, **kwargs)
-    raise ValueError(f"Unknown MODEL_PROVIDER: {provider!r} (expected 'anthropic' or 'openai')")
+    if provider == "deepseek":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(model=model, max_tokens=max_tokens, timeout=config.llm_timeout_seconds(), max_retries=1,
+                          base_url=os.environ.get("DEEPSEEK_BASE_URL") or DEEPSEEK_BASE_URL,
+                          api_key=os.environ.get("DEEPSEEK_API_KEY"), **kwargs)
+    raise ValueError(f"Unknown MODEL_PROVIDER: {provider!r} (expected 'anthropic', 'openai' or 'deepseek')")
 
 
 def content_text(response: Any) -> str:
