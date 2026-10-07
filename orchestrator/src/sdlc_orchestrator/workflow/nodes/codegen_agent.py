@@ -20,6 +20,11 @@ Strategies (fallback path):
           synchronous counters, in-memory rate limiter. Degraded on
           purpose; recorded in state, events and the generated docs.
 
+Each branch is generated in small GROUPS (plan_groups): 1-5 related files per model call, in dependency
+order (e.g. dto -> service -> security/filters -> web -> tests). Later groups see the files earlier groups
+wrote, a group whose reply is missing or truncated files is re-asked for just those files, and a retry
+regenerates only the failing files in chunks. A single huge reply is what used to truncate and fail runs.
+
 Output format is a greppable delimiter protocol, not JSON, because large
 Java files are miserable to keep valid inside JSON strings.
 """
@@ -27,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 import yaml
 
@@ -132,6 +138,113 @@ DO NOT write: entities, repositories, application.yml, Dockerfile, docker-compos
 }
 
 
+MAX_GROUP_FILES = 5   # a group never asks for more files than this in one call
+REPAIR_PASSES = 2     # re-asks for files a reply left out or cut off, before the group counts as failed
+MAIN_JAVA = "src/main/java/"
+TEST_JAVA = "src/test/java/com/rahul/urlshortener/"
+
+LAYER_GROUPS = {   # ordered: earlier groups are context for later ones
+    "impl_data": [("persistence", ("domain", "entity", "repository")), ("config", ("config",))],
+    "impl_api": [("dto-exceptions", ("dto", "exception")), ("services", ("service",)),
+                 ("security-filters", ("security", "filter")), ("web", ("web",))],
+}
+RESOURCE_GROUPS = {
+    "impl_data": [
+        ("application-yml", "src/main/resources/application.yml",
+         "src/main/resources/application.yml: env-var driven datasource/redis/flyway config, spring.jpa.hibernate.ddl-auto: validate, "
+         "actuator health/info/metrics exposed and every design.configuration property."),
+        ("docker-compose", "docker-compose.yml",
+         "docker-compose.yml with services app, postgres, redis (healthchecks), exactly as the branch rules above describe."),
+    ],
+}
+TEST_GROUPS = {
+    "impl_api": [
+        ("unit-tests", None, "unit tests for the base62 ID generator and the link-expiry logic (plain JUnit, no containers, no Spring context)."),
+        ("integration-test", None, "ONE integration test class following the integration-test rules above (RANDOM_PORT + Testcontainers via "
+                                   "@DynamicPropertySource, java.net.http.HttpClient). Read the generated sources below for real class and method names."),
+        ("contract-test", TEST_JAVA + "ContractTest.java", "ContractTest.java following the contract-test rules above."),
+    ],
+}
+
+
+def _chunks(items: list, size: int) -> list[list]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def plan_groups(design: dict, branch: str, mode: str = "greenfield") -> list[dict]:
+    """Ordered generation groups for a branch. Each: name, instruction, components, expected (paths the reply
+    must contain), prefix (a directory a reply must write into when no path is known) and a `owns` test."""
+    comps = [c for c in _select_components(design, branch) if c.get("layer") != "test"]
+    groups: list[dict] = []
+    used: set[int] = set()
+    for name, layers in LAYER_GROUPS.get(branch, []):
+        picked = [c for c in comps if c.get("layer") in layers]
+        used.update(id(c) for c in picked)
+        for i, part in enumerate(_chunks(picked, MAX_GROUP_FILES), 1):
+            groups.append({"name": name if len(picked) <= MAX_GROUP_FILES else f"{name}-{i}",
+                           "instruction": f"the {name} classes from YOUR COMPONENTS (layers: {', '.join(layers)}).",
+                           "components": part, "expected": [c["path"] for c in part if c.get("path")], "prefix": None})
+    rest = [c for c in comps if id(c) not in used]
+    for i, part in enumerate(_chunks(rest, MAX_GROUP_FILES), 1):
+        groups.append({"name": f"other-{i}", "instruction": "the remaining classes from YOUR COMPONENTS.",
+                       "components": part, "expected": [c["path"] for c in part if c.get("path")], "prefix": None})
+    if mode == "brownfield":   # the scaffold, config and baseline tests exist: only the planned classes (and planned tests) change
+        tests = [c for c in _select_components(design, branch) if c.get("layer") == "test"]
+        for i, part in enumerate(_chunks(tests, MAX_GROUP_FILES), 1):
+            groups.append({"name": f"tests-{i}", "instruction": "the planned test classes from YOUR COMPONENTS.", "components": part,
+                           "expected": [c["path"] for c in part if c.get("path")], "prefix": None, "tests": True})
+        return groups
+    for name, path, text in RESOURCE_GROUPS.get(branch, []):
+        groups.append({"name": name, "instruction": text, "components": [], "expected": [path], "prefix": None})
+    for name, path, text in TEST_GROUPS.get(branch, []):
+        groups.append({"name": name, "instruction": text, "components": [], "expected": [path] if path else [],
+                       "prefix": None if path else "src/test/", "tests": True})
+    return groups
+
+
+def fix_groups(targets: list[str]) -> list[dict]:
+    """Retry plan: only the failing files, a few per call."""
+    return [{"name": f"fix-{i}", "instruction": "fix the failing files listed below.", "components": [],
+             "expected": part, "prefix": None, "fix": True} for i, part in enumerate(_chunks(targets, MAX_GROUP_FILES), 1)]
+
+
+def _owns(group: dict, path: str) -> bool:
+    return path in group["expected"] or bool(group.get("prefix") and path.startswith(group["prefix"])) \
+        or any(c.get("path") == path for c in group.get("components", []))
+
+
+def _missing(group: dict, generated: dict[str, str], problems: list[str], deleted: set[str] = frozenset()) -> list[str]:
+    """What the reply still owes: expected paths it did not contain (cut-off files included)."""
+    if group.get("optional"):
+        return []
+    missing = [p for p in group["expected"] if p not in generated and p not in deleted]
+    for pr in problems:
+        m = re.search(r"incomplete file\(s\): ([^;\n]+)", pr)
+        if m:
+            missing += [x.strip() for x in m.group(1).split(",") if x.strip() and x.strip() not in generated and x.strip() not in missing and x.strip() not in deleted]
+    if group.get("prefix") and not any(p.startswith(group["prefix"]) for p in generated):
+        missing.append(f"(at least one file under {group['prefix']})")
+    return missing
+
+
+def _context_block(written: dict[str, str], repo, group: dict, budget: int = 60_000) -> str:
+    """Sources earlier groups already wrote, so this group uses their real names and signatures. Test groups
+    also get main sources found on disk (the other branch runs in parallel and may have written some)."""
+    out, used = [], 0
+    sources = dict(written)
+    if group.get("tests"):
+        for p in sorted((repo / "src/main/java").rglob("*.java")) if (repo / "src/main/java").exists() else []:
+            sources.setdefault(p.relative_to(repo).as_posix(), p.read_text())
+    for path, content in sources.items():
+        if _owns(group, path) or not path.startswith(MAIN_JAVA):
+            continue
+        if used + len(content) > budget:
+            break
+        out.append(f"### ALREADY WRITTEN {path}\n{content}")
+        used += len(content)
+    return "\n\n".join(out)
+
+
 def _select_components(design: dict, branch: str) -> list[dict]:
     return [c for c in design.get("component_plan", []) if c.get("branch") == branch]
 
@@ -184,7 +297,43 @@ def _existing_context(repo, state: dict, budget: int = 60_000) -> str:
     return "\n\n".join(out)
 
 
-def build_prompt_parts(state: dict, branch: str, repo) -> tuple[str, str, str]:
+def _group_parts(state: dict, branch: str, repo, group: dict, written: dict[str, str]) -> list[str]:
+    """Suffix sections for one generation group (the design/system prefix stays identical, so it stays cached)."""
+    wanted = group["expected"] or ([f"any files under {group['prefix']}"] if group.get("prefix") else [])
+    parts = [f"GROUP: {group['name']}. Write ONLY {group['instruction']}\nGROUP FILES (complete content each, nothing else): "
+             + (", ".join(wanted) or "the files this group needs (use the exact paths from YOUR COMPONENTS)")
+             + "\nOther groups of this branch are generated in separate steps; classes of other groups are described by YOUR COMPONENTS "
+               "and, where already written, shown below. Do not re-output them."]
+    if state.get("mode") == "brownfield":
+        existing = [f"### EXISTING {r}\n{(repo / r).read_text()}" for r in state.get("impacted_modules", [])
+                    if (repo / r).is_file() and _owns(group, r)]
+        if existing:
+            parts.append("EXISTING FILES TO MODIFY (output the COMPLETE new version of each file you change):\n" + "\n\n".join(existing)
+                         + "\nPreserve all existing behaviour and tests.")
+    ctx = _context_block(written, repo, group)
+    if ctx:
+        parts.append("CODE ALREADY WRITTEN FOR THIS PROJECT (use these exact names and signatures):\n" + ctx)
+    feedback = state.get("failure_feedback")
+    if feedback:
+        owner = state.get("artifact_owner", {})
+        mine = {p: c for p, c in (state.get("code_artifacts") or {}).items()
+                if owner.get(p) == branch and c and not p.endswith((".sql", "openapi.yaml")) and _owns(group, p)}
+        if group.get("fix"):
+            parts.append("PREVIOUS ATTEMPT FAILED. Regenerate ONLY the files under GROUP FILES (complete content each; files that were cut "
+                         f"off or never written must be written in full).\nFAILURE OUTPUT:\n{feedback}")
+            parts.append("THEIR CURRENT CONTENT:\n" + "\n\n".join(f"### CURRENT {p}\n{c}" for p, c in mine.items()))
+        elif mine:
+            parts.append("PREVIOUS ATTEMPT FAILED. Fix the cause ONLY if it is in this group's files; output only the files that need to change "
+                         f"(complete content each) and nothing if none do.\nFAILURE OUTPUT:\n{feedback}")
+            parts.append("THIS GROUP'S CURRENT FILES:\n" + "\n\n".join(f"### CURRENT {p}\n{c}" for p, c in mine.items()))
+        else:
+            parts.append("A PREVIOUS ATTEMPT FAILED and the workspace was reset to the clean scaffold. Write this group from scratch, "
+                         f"avoiding the cause.\nFAILURE OUTPUT:\n{feedback}")
+    return parts
+
+
+def build_prompt_parts(state: dict, branch: str, repo, group: dict | None = None,
+                       written: dict[str, str] | None = None) -> tuple[str, str, str]:
     """(system, stable_prefix, variable_suffix). The prefix (design + this branch's
     components) is identical across retries of a branch, so it is prompt-cached; the
     suffix carries everything that changes per attempt (pom, existing files, failures)."""
@@ -198,6 +347,8 @@ def build_prompt_parts(state: dict, branch: str, repo) -> tuple[str, str, str]:
         f"YOUR COMPONENTS ({branch}):\n" + json.dumps(_select_components(design, branch), indent=1),
     ])
     parts = ["POM.XML (current):\n" + ((repo / "pom.xml").read_text() if (repo / "pom.xml").exists() else "(missing)")]
+    if group is not None:
+        return system, prefix, "\n\n".join(parts + _group_parts(state, branch, repo, group, written or {}))
     if state.get("mode") == "brownfield":
         parts.append("EXISTING FILES TO MODIFY (output the COMPLETE new version of each file you change):\n" + _existing_context(repo, state))
         parts.append("Preserve all existing behaviour and tests; only add/modify what the requirement needs.")
@@ -244,64 +395,121 @@ def _model_for_attempt(state: dict) -> tuple[str, bool]:
     return model_for("codegen", escalated=escalated), escalated
 
 
+def _not_owned(branch: str, path: str) -> bool:
+    """Files a branch must never write (the other branch, or the orchestrator, owns them)."""
+    if branch == "impl_data":
+        return (path in ("Dockerfile", ".dockerignore", deploy.OPENAPI_CONFIG_PATH) or path.startswith("src/test/")
+                or "/web/" in path or path.endswith("/openapi.yaml") or "/db/migration/" in path)
+    return path in ("pom.xml", "Dockerfile", "docker-compose.yml") or path.startswith("src/main/resources/")
+
+
+def _generate_group(state: dict, branch: str, repo, group: dict, written: dict[str, str], model: str) -> tuple[dict[str, str], str, list[str]]:
+    """One group = one small model call. If the reply leaves out (or cuts off) files the group owes, ask again for
+    just those, escalating the model on the last pass. Returns (files, raw reply text, unresolved problems)."""
+    run_id = state["run_id"]
+    system, prefix, suffix = build_prompt_parts(state, branch, repo, group, written)
+    text = invoke_llm("codegen", system, suffix, run_id=run_id, cache_prefix=prefix, model=model)
+    generated, problems = parse_file_blocks(text)
+    deletes_text = text
+    for n in range(1, REPAIR_PASSES + 1):
+        missing = _missing(group, generated, problems, set(parse_deletes(deletes_text)[0]))
+        if not missing:
+            break
+        log_event(run_id, branch, "group_repair", {"group": group["name"], "missing": missing, "pass": n},
+                  actor="system:orchestrator", outcome="retrying", reason="reply missing or truncated files; re-asking for just those")
+        redo = model_for("codegen", escalated=True) if n == REPAIR_PASSES else model
+        more = invoke_llm("codegen", system,
+                          suffix + "\n\nYOUR PREVIOUS REPLY WAS INCOMPLETE. Output ONLY these files, each COMPLETE and short enough to "
+                                   f"finish: {', '.join(missing)}", run_id=run_id, cache_prefix=prefix, model=redo)
+        more_files, more_problems = parse_file_blocks(more)
+        generated.update(more_files)
+        problems = [x for x in problems if not x.startswith("output truncated")] + more_problems
+        deletes_text += "\n" + more
+    left = _missing(group, generated, problems, set(parse_deletes(deletes_text)[0]))
+    # truncation notes are only a problem if a file is still owed; unsafe-path notes always are
+    problems = [x for x in problems if not x.startswith("output truncated")]
+    if left:
+        problems.append(f"{branch}/{group['name']}: missing or incomplete file(s): {', '.join(left)}"[:400])
+    return generated, deletes_text, problems
+
+
 def _run_branch(state: dict, branch: str) -> dict:
     run_id = state["run_id"]
     repo = repo_path(state)
     design = state["design_doc"]
     errors: list[str] = []
+    dropped: list[str] = []
 
     artifacts: dict[str, str] = {}
     removed: list[str] = []
     if branch == "impl_data":
         artifacts.update(_write_deterministic(repo, design))
 
-    components = _select_components(design, branch)
-    generated: dict[str, str] = {}
-    if components or state.get("failure_feedback"):
-        system, prefix, suffix = build_prompt_parts(state, branch, repo)
+    owner = state.get("artifact_owner") or {}
+    owned_now = [p for p, c in (state.get("code_artifacts") or {}).items()
+                 if owner.get(p) == branch and c and not p.endswith((".sql", "openapi.yaml"))]
+    feedback = state.get("failure_feedback")
+    targets = failing_paths(feedback, owned_now) if feedback else []
+    if targets:
+        groups = fix_groups(targets)
+    else:
+        groups = plan_groups(design, branch, state.get("mode", "greenfield"))
+        if feedback and owned_now:   # failure not attributable to a file: each group may change what it owns, or nothing
+            groups = [{**g, "optional": True} for g in groups]
+
+    written: dict[str, str] = {}
+    if groups:
         model, escalated = _model_for_attempt(state)
         if escalated and model != model_for("codegen"):
             log_event(run_id, branch, "model_escalation", {"model": model, "failed_attempts": failed_attempts(state)},
                       actor="system:orchestrator", outcome="escalated",
                       reason=f"{failed_attempts(state)} failed attempt(s); codegen moved to the stronger model")
-        text = invoke_llm("codegen", system, suffix, run_id=run_id, cache_prefix=prefix, model=model)
-        generated, problems = parse_file_blocks(text)
+    for group in groups:
+        started = time.monotonic()
+        generated, raw, problems = _generate_group(state, branch, repo, group, written, model)
         errors += problems
-
-        # ownership discipline: the data branch must not emit tests/controllers etc. and vice versa
-        for path in list(generated):
-            if branch == "impl_data" and (path in ("Dockerfile", ".dockerignore", deploy.OPENAPI_CONFIG_PATH) or path.startswith("src/test/") or "/web/" in path or path.endswith("/openapi.yaml") or "/db/migration/" in path):
-                errors.append(f"{branch} emitted a file it does not own: {path}")
-                generated.pop(path)
-            if branch == "impl_api" and (path in ("pom.xml", "Dockerfile", "docker-compose.yml") or path.startswith("src/main/resources/")):
-                errors.append(f"{branch} emitted a file it does not own: {path}")
-                generated.pop(path)
-        artifacts.update(generated)
-        deletes, del_problems = parse_deletes(text)
+        kept: dict[str, str] = {}
+        for path, content in generated.items():
+            if _not_owned(branch, path):
+                dropped.append(path)          # a stray file is dropped, not a failed run
+            elif path in written and not _owns(group, path):
+                dropped.append(path)          # an earlier group already wrote it; do not let this one overwrite it
+            else:
+                kept[path] = content
+        deletes, del_problems = parse_deletes(raw)
         errors += del_problems
-        owned = state.get("artifact_owner") or {}
         for rel in deletes:
-            if owned.get(rel) != branch:
+            if rel in removed:
+                continue
+            if owner.get(rel) != branch:
                 errors.append(f"{branch} tried to delete {rel}, which it did not create in this run")
                 continue
             (repo / rel).unlink(missing_ok=True)
             removed.append(rel)
-        if not generated and not removed and not state.get("failure_feedback"):
-            errors.append(f"{branch}: model produced no usable files")
+        write_files(repo, kept)               # on disk now, so the next group is generated against real code
+        written.update(kept)
+        artifacts.update(kept)
+        log_event(run_id, branch, "group_generated", {"group": group["name"], "files": sorted(kept), "ok": not problems},
+                  actor=f"agent:codegen:{branch}", outcome="ok" if not problems else "partial",
+                  duration_ms=int((time.monotonic() - started) * 1000))
+    if groups and not artifacts and not removed and not feedback:
+        errors.append(f"{branch}: model produced no usable files")
 
-    written = write_files(repo, artifacts)
-    log_event(run_id, branch, "files_written", {"files": written, "deleted": removed, "problems": errors[:5]}, actor=f"agent:codegen:{branch}",
-              outcome="ok" if not errors else "partial")
+    written_paths = write_files(repo, artifacts)
+    log_event(run_id, branch, "files_written", {"files": written_paths, "deleted": removed, "dropped": sorted(set(dropped)),
+                                                "groups": [g["name"] for g in groups], "problems": errors[:5]},
+              actor=f"agent:codegen:{branch}", outcome="ok" if not errors else "partial")
     return {
         "code_artifacts": {**artifacts, **{p: "" for p in removed}},
         "artifact_owner": {**{p: branch for p in set(artifacts) | {
             p for p, b in (state.get("artifact_owner") or {}).items() if b == branch}},
             **{p: "deleted" for p in removed}},
-        "branch_status": {branch: {"ok": not errors, "errors": errors, "files": written}},
+        "branch_status": {branch: {"ok": not errors, "errors": errors, "files": written_paths}},
         "tasks": set_task_status(state, [branch], "in_progress"),
         "_outcome": "ok" if not errors else "partial",
         "_reason": "; ".join(errors)[:300] or None,
-        "_detail": {"files": written, "deleted": removed, "strategy": (state.get("codegen_strategy") or "full")},
+        "_detail": {"files": written_paths, "deleted": removed, "strategy": (state.get("codegen_strategy") or "full"),
+                    "groups": [g["name"] for g in groups]},
     }
 
 

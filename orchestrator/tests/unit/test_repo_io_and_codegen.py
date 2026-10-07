@@ -94,3 +94,62 @@ def test_failing_paths_targets_only_named_files():
     assert failing_paths("[ERROR] /x/Foo.java:[3,1] cannot find symbol", owned) == ["src/main/java/a/Foo.java"]
     assert failing_paths("contract: GET /x not implemented", owned) == []
     assert failing_paths("truncated; incomplete file(s): src/main/java/a/New.java", owned) == ["src/main/java/a/New.java"]
+
+
+def _design(*specs):
+    return {"api_contract": {"paths": {}}, "configuration": {}, "adrs": [], "migrations": [],
+            "component_plan": [{"class": f"a.{n}", "path": f"src/main/java/a/{n}.java", "layer": layer, "branch": branch}
+                               for n, layer, branch in specs]}
+
+
+def test_plan_groups_split_a_branch_in_dependency_order():
+    d = _design(("Req", "dto", "impl_api"), ("Svc", "service", "impl_api"), ("Ctl", "web", "impl_api"),
+                ("Sec", "security", "impl_api"), ("Odd", "weird", "impl_api"), ("Ent", "domain", "impl_data"))
+    names = [g["name"] for g in cg.plan_groups(d, "impl_api")]
+    assert names == ["dto-exceptions", "services", "security-filters", "web", "other-1", "unit-tests", "integration-test", "contract-test"]
+    assert [g["name"] for g in cg.plan_groups(d, "impl_data")] == ["persistence", "application-yml", "docker-compose"]
+    assert all(len(g["expected"]) <= cg.MAX_GROUP_FILES for g in cg.plan_groups(d, "impl_api"))
+
+
+def test_plan_groups_cap_group_size_and_brownfield_skips_boilerplate():
+    d = _design(*[(f"S{i}", "service", "impl_api") for i in range(7)])
+    svc = [g for g in cg.plan_groups(d, "impl_api") if g["name"].startswith("services")]
+    assert [len(g["expected"]) for g in svc] == [5, 2]
+    assert [g["name"] for g in cg.plan_groups(d, "impl_data", "brownfield")] == []
+    assert not any(g["name"] in ("unit-tests", "contract-test") for g in cg.plan_groups(d, "impl_api", "brownfield"))
+
+
+def _block(path):
+    return f"===FILE: {path}===\nclass X {{}}\n===END==="
+
+
+def test_group_reasks_only_for_missing_or_truncated_files(monkeypatch, tmp_path):
+    (tmp_path / "pom.xml").write_text("<p/>")
+    replies = iter(["===FILE: src/main/java/a/A.java===\nclass A {}\n===END===\n===FILE: src/main/java/a/B.java===\nclass B {",
+                    _block("src/main/java/a/B.java")])
+    prompts = []
+    monkeypatch.setattr(cg, "invoke_llm", lambda stage, system, user, **kw: (prompts.append(user), next(replies))[1])
+    group = {"name": "services", "instruction": "x", "components": [], "expected": ["src/main/java/a/A.java", "src/main/java/a/B.java"], "prefix": None}
+    state = {"run_id": "r", "design_doc": _design(), "mode": "greenfield"}
+    files, _, problems = cg._generate_group(state, "impl_api", tmp_path, group, {}, "m")
+    assert set(files) == set(group["expected"]) and problems == []
+    assert len(prompts) == 2 and "ONLY these files" in prompts[1] and "B.java" in prompts[1].split("ONLY these files")[1]
+
+
+def test_group_that_stays_incomplete_reports_the_missing_file(monkeypatch, tmp_path):
+    (tmp_path / "pom.xml").write_text("<p/>")
+    monkeypatch.setattr(cg, "invoke_llm", lambda *a, **k: "")
+    group = {"name": "web", "instruction": "x", "components": [], "expected": ["src/main/java/a/C.java"], "prefix": None}
+    _, _, problems = cg._generate_group({"run_id": "r", "design_doc": _design()}, "impl_api", tmp_path, group, {}, "m")
+    assert any("incomplete file(s): src/main/java/a/C.java" in p for p in problems)
+
+
+def test_stray_files_are_dropped_not_failures(monkeypatch, tmp_path):
+    (tmp_path / "pom.xml").write_text("<p/>")
+    d = _design(("Ent", "domain", "impl_data"))
+    reply = "\n".join(_block(p) for p in ["src/main/java/a/Ent.java", "src/test/java/a/StrayTest.java"])
+    monkeypatch.setattr(cg, "invoke_llm", lambda *a, **k: reply)
+    monkeypatch.setattr(cg, "repo_path", lambda s: tmp_path)
+    out = cg._run_branch({"run_id": "r", "design_doc": d, "mode": "brownfield"}, "impl_data")
+    assert out["branch_status"]["impl_data"]["ok"] is True
+    assert "src/test/java/a/StrayTest.java" not in out["code_artifacts"] and "src/main/java/a/Ent.java" in out["code_artifacts"]
